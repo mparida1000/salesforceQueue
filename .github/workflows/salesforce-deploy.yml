@@ -6,7 +6,7 @@ on:
 
 # QUEUE SYSTEM
 concurrency:
-  group: salesforce-deploy-${{ github.event.pull_request.number }}
+  group: salesforce-deploy
   cancel-in-progress: false
 
 env:
