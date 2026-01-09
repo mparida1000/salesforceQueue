@@ -12,22 +12,67 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout with full history
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Get all history, not just latest
+          fetch-depth: 0
     
-      - name: Install SFDX
-        run: npm install -g sfdx-cli
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+    
+      - name: Install latest Salesforce CLI
+        run: npm install -g @salesforce/cli@latest
+    
+      - name: Verify SFDX installation
+        run: sf --version
     
       - name: Create JWT key file
-        run: echo "${{ secrets.SF_JWT_KEY }}" > server.key
+        id: create-key
+        run: |
+          echo "Creating JWT key file..."
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
+          
+          # Verify key file was created
+          if [ -f "server.key" ]; then
+            echo "✅ JWT key file created"
+            ls -la server.key
+          else
+            echo "❌ Failed to create JWT key file"
+            exit 1
+          fi
     
       - name: Authenticate to Salesforce
-        run: sfdx auth:jwt:grant --clientid "${{ secrets.SF_CONSUMER_KEY }}" --jwtkeyfile server.key --username "${{ secrets.SF_USERNAME }}" --instanceurl "${{ secrets.SF_INSTANCE_URL }}"
+        id: auth
+        run: |
+          echo "Starting Salesforce authentication..."
+          
+          # Print debug info (without exposing secrets)
+          echo "Username: ${{ secrets.SF_USERNAME }}"
+          echo "Instance URL: ${{ secrets.SF_INSTANCE_URL }}"
+          echo "Consumer Key length: ${#SF_CONSUMER_KEY} chars"
+          
+          # Authenticate using JWT
+          sf org login jwt \
+            --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
+            --jwt-key-file server.key \
+            --username "${{ secrets.SF_USERNAME }}" \
+            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
+            --alias prod-org \
+            --set-default
+          
+          # Verify authentication was successful
+          echo "✅ Authentication successful!"
+          
+          # List orgs to confirm
+          echo "Connected orgs:"
+          sf org list
     
-      - name: Deploy changed Apex files
+      - name: Get changed Apex files
+        id: get-changes
         run: |
           # Get the commit BEFORE the PR merge (parent of merge commit)
           BASE=$(git log --pretty=format:"%H" -1 ${{ github.event.pull_request.merge_commit_sha }}^)
@@ -40,17 +85,42 @@ jobs:
           
           if [ -z "$CHANGED" ]; then
             echo "No Apex class changes found"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
           echo "Changed Apex files:"
           echo "$CHANGED"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "changed_files=$CHANGED" >> $GITHUB_OUTPUT
+    
+      - name: Deploy changed Apex files
+        if: steps.get-changes.outputs.has_changes == 'true'
+        run: |
+          echo "Starting Salesforce deployment..."
           
-          # Deploy each file
-          for file in $CHANGED; do
-            echo "Deploying: $file"
-            sfdx force:source:deploy \
-              --sourcepath "$file" \
-              --targetusername "${{ secrets.SF_USERNAME }}" \
-              --wait 10
-          done
+          # Get the changed files from previous step
+          CHANGED_FILES="${{ steps.get-changes.outputs.changed_files }}"
+          
+          # Convert newlines to commas for SFDX
+          COMMA_SEPARATED=$(echo "$CHANGED_FILES" | tr '\n' ',')
+          
+          # Remove trailing comma if exists
+          COMMA_SEPARATED=${COMMA_SEPARATED%,}
+          
+          echo "Files to deploy: $COMMA_SEPARATED"
+          
+          # Deploy using the new SF command
+          sf project deploy start \
+            --source-dir "$COMMA_SEPARATED" \
+            --target-org prod-org \
+            --wait 30 \
+            --verbose
+          
+          echo "✅ Deployment completed successfully!"
+    
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up temporary files..."
+          rm -f server.key 2>/dev/null || true
