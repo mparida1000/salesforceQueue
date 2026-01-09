@@ -2,7 +2,7 @@ name: Deploy Apex
 on:
   pull_request:
     types: [closed]
-    branches: [main]
+    branches: [dev]
 
 # THIS LINE CREATES THE QUEUE
 concurrency:
