@@ -4,7 +4,7 @@ name: Deploy Apex
 on:
   pull_request:
     types: [closed]
-    branches: [main]
+    branches: [dev, test]
 
 # QUEUE MAGIC HAPPENS HERE
 concurrency:
