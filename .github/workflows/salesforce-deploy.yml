@@ -13,6 +13,10 @@ jobs:
       # 1. This pauses the job so they run one-by-one
       - name: Wait for previous deployments
         uses: softprops/turnstyle@v1
+        with:
+          # This ensures it waits for ANY other run of "Deploy Apex"
+          poll-interval-seconds: 10
+          continue-on-error: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
