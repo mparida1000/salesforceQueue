@@ -1,0 +1,570 @@
+# .github/workflows/salesforce-deploy.yml
+name: 🚀 Salesforce Deployment Queue
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main, master]
+
+# QUEUE CONFIGURATION - Prevents parallel deployments
+concurrency:
+  group: sfdc-prod-deploy-${{ github.event.pull_request.base.ref }}
+  cancel-in-progress: false
+
+env:
+  # Salesforce Configuration
+  SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
+  SF_LOGIN_URL: https://login.salesforce.com
+  # Deployment Settings
+  MAX_RETRY_COUNT: 2
+  DEPLOYMENT_TIMEOUT_MINUTES: 30
+
+jobs:
+  # JOB 1: Setup and Validation
+  setup-and-validate:
+    name: 🔍 Setup & Validate
+    runs-on: ubuntu-latest
+    outputs:
+      source_diff_path: ${{ steps.get-diff.outputs.diff_path }}
+      has_changes: ${{ steps.check-changes.outputs.has_changes }}
+      pr_number: ${{ github.event.pull_request.number }}
+      commit_sha: ${{ github.event.pull_request.merge_commit_sha }}
+      author: ${{ github.actor }}
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for diff
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      
+      - name: 🔧 Setup Salesforce CLI
+        uses: salesforceactions/setup-sfdx@v4
+        with:
+          sfdx-version: 'latest'
+      
+      - name: 📊 Get Queue Status
+        id: queue-status
+        uses: actions/github-script@v6
+        env:
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        with:
+          script: |
+            const { data: workflowRuns } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: context.workflow.split('/').pop().replace('.yml', ''),
+              status: 'queued',
+              per_page: 20
+            });
+            
+            // Find our position
+            let position = 0;
+            let found = false;
+            
+            for (const run of workflowRuns.workflow_runs) {
+              if (run.id == process.env.CURRENT_RUN_ID) {
+                found = true;
+                break;
+              }
+              position++;
+            }
+            
+            // If not found in queued, check in_progress
+            if (!found) {
+              const { data: inProgressRuns } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: context.workflow.split('/').pop().replace('.yml', ''),
+                status: 'in_progress',
+                per_page: 5
+              });
+              
+              position = inProgressRuns.workflow_runs.length + (found ? 0 : 1);
+            }
+            
+            console.log(`🎯 Queue Position: ${position}`);
+            
+            // Create status comment if position > 0
+            if (position > 0) {
+              const comment = `
+              ## ⏳ Salesforce Deployment Queue Status
+              
+              **PR #${{ github.event.pull_request.number }}** is in the deployment queue.
+              
+              📊 **Position in queue:** ${position}
+              ⏰ **Estimated wait time:** ~${position * 15} minutes
+              👤 **Requested by:** ${{ github.actor }}
+              🔗 **View queue:** https://github.com/${{ github.repository }}/actions/workflows/${{ github.workflow }}
+              
+              The deployment will start automatically when previous deployments complete.
+              `;
+              
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: ${{ github.event.pull_request.number }},
+                  body: comment
+                });
+              } catch (error) {
+                console.log('Note: Could not create comment (PR might be already merged)');
+              }
+            }
+            
+            core.setOutput('position', position);
+          result-encoding: string
+      
+      - name: 🔄 Get Changed Files
+        id: get-diff
+        run: |
+          # Get the base commit (before PR) and head commit (after PR)
+          BASE_COMMIT=$(git log --oneline ${{ github.event.pull_request.base.sha }}^..${{ github.event.pull_request.base.sha }} | tail -1 | awk '{print $1}')
+          HEAD_COMMIT=${{ github.event.pull_request.merge_commit_sha }}
+          
+          echo "Base commit: $BASE_COMMIT"
+          echo "Head commit: $HEAD_COMMIT"
+          
+          # Get changed Salesforce files
+          CHANGED_FILES=$(git diff --name-only $BASE_COMMIT..$HEAD_COMMIT | grep -E '(\.cls$|\.trigger$|\.page$|\.component$|\.object$|\.layout$|\.profile$|\.permissionset$|\.customMetadata$|\.labels$|\.resource$|\.workflow$|\.flow$|\.email$|\.approvalProcess$|\.queue$|\.group$|\.role$|\.site$|\.dashboard$|\.report$|\.tab$)' || true)
+          
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No Salesforce files changed in this PR"
+            echo "diff_path=" >> $GITHUB_OUTPUT
+          else
+            # Create directory for changed files
+            mkdir -p changed-sources
+            # Copy changed files
+            for file in $CHANGED_FILES; do
+              if [ -f "$file" ]; then
+                mkdir -p "changed-sources/$(dirname "$file")"
+                cp "$file" "changed-sources/$file"
+              fi
+            done
+            
+            # Count files
+            FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l | tr -d ' ')
+            echo "Found $FILE_COUNT changed Salesforce files"
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+            
+            echo "diff_path=changed-sources" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: ✅ Check for Changes
+        id: check-changes
+        run: |
+          if [ -d "changed-sources" ] && [ "$(ls -A changed-sources 2>/dev/null)" ]; then
+            echo "Changes detected for deployment"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "No changes to deploy"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: 📝 Generate Deployment Manifest
+        if: steps.check-changes.outputs.has_changes == 'true'
+        run: |
+          # Create package.xml for changed files
+          cd changed-sources
+          
+          # Create package.xml structure
+          cat > package.xml << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+          EOF
+          
+          # Map file extensions to metadata types
+          declare -A type_map=(
+            ["cls"]="ApexClass"
+            ["trigger"]="ApexTrigger"
+            ["page"]="ApexPage"
+            ["component"]="ApexComponent"
+            ["object"]="CustomObject"
+            ["layout"]="Layout"
+            ["profile"]="Profile"
+            ["permissionset"]="PermissionSet"
+            ["customMetadata"]="CustomMetadata"
+            ["labels"]="CustomLabels"
+            ["resource"]="StaticResource"
+            ["workflow"]="Workflow"
+            ["flow"]="Flow"
+            ["email"]="EmailTemplate"
+            ["approvalProcess"]="ApprovalProcess"
+            ["queue"]="Queue"
+            ["group"]="Group"
+            ["role"]="Role"
+            ["site"]="CustomSite"
+            ["dashboard"]="Dashboard"
+            ["report"]="Report"
+            ["tab"]="CustomTab"
+          )
+          
+          # Group files by type
+          for ext in "${!type_map[@]}"; do
+            files=$(find . -name "*.$ext" -type f | sed 's|^\./||')
+            if [ -n "$files" ]; then
+              echo "  <types>" >> package.xml
+              for file in $files; do
+                member=$(basename "$file" ".$ext")
+                echo "    <members>$member</members>" >> package.xml
+              done
+              echo "    <name>${type_map[$ext]}</name>" >> package.xml
+              echo "  </types>" >> package.xml
+            fi
+          done
+          
+          cat >> package.xml << EOF
+            <version>58.0</version>
+          </Package>
+          EOF
+          
+          echo "Generated package.xml:"
+          cat package.xml
+          
+          # Create destructiveChanges.xml if needed (for deletions)
+          # You can extend this to detect deletions from git diff
+          cat > destructiveChanges.xml << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+            <version>58.0</version>
+          </Package>
+          EOF
+
+  # JOB 2: Queue Monitor (waits for turn)
+  queue-monitor:
+    name: ⏳ Queue Monitor
+    runs-on: ubuntu-latest
+    needs: setup-and-validate
+    if: needs.setup-and-validate.outputs.has_changes == 'true'
+    
+    steps:
+      - name: 📊 Monitor Queue Position
+        uses: actions/github-script@v6
+        env:
+          WORKFLOW_NAME: ${{ github.workflow }}
+          REPO: ${{ github.repository }}
+        with:
+          script: |
+            const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+            const MAX_WAIT_MINUTES = 180; // 3 hours max
+            const CHECK_INTERVAL_SECONDS = 30;
+            let waitedMinutes = 0;
+            
+            console.log('Starting queue monitor...');
+            
+            while (waitedMinutes < MAX_WAIT_MINUTES) {
+              // Get all workflow runs
+              const { data: allRuns } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: process.env.WORKFLOW_NAME.split('/').pop().replace('.yml', ''),
+                per_page: 50
+              });
+              
+              // Filter to queued and in_progress runs
+              const activeRuns = allRuns.workflow_runs.filter(run => 
+                run.status === 'queued' || run.status === 'in_progress'
+              ).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+              
+              // Find our position
+              const ourRunIndex = activeRuns.findIndex(run => run.id === ${{ github.run_id }});
+              
+              if (ourRunIndex === 0) {
+                console.log('🎉 Our turn! Starting deployment...');
+                break;
+              } else if (ourRunIndex > 0) {
+                console.log(`⏳ Position in queue: ${ourRunIndex}`);
+                console.log(`🕒 Waited: ${waitedMinutes} minutes`);
+                console.log(`⏰ Next check in ${CHECK_INTERVAL_SECONDS} seconds...`);
+                
+                // Update comment if it's been a while
+                if (waitedMinutes % 15 === 0) {
+                  try {
+                    const comment = `## ⏳ Queue Update
+                    
+                    **PR #${{ github.event.pull_request.number }}** is still in queue.
+                    
+                    📊 **Current position:** ${ourRunIndex}
+                    ⏰ **Time waited:** ${waitedMinutes} minutes
+                    👤 **Requested by:** ${{ github.actor }}
+                    
+                    Still waiting for previous deployments to complete...
+                    `;
+                    
+                    // Try to update existing comment
+                    const { data: comments } = await github.rest.issues.listComments({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: ${{ github.event.pull_request.number }}
+                    });
+                    
+                    const queueComment = comments.find(c => c.body.includes('Salesforce Deployment Queue Status'));
+                    if (queueComment) {
+                      await github.rest.issues.updateComment({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        comment_id: queueComment.id,
+                        body: comment
+                      });
+                    }
+                  } catch (error) {
+                    console.log('Could not update comment');
+                  }
+                }
+                
+                await wait(CHECK_INTERVAL_SECONDS * 1000);
+                waitedMinutes += CHECK_INTERVAL_SECONDS / 60;
+              } else {
+                console.log('⚠️ Run not found in queue, proceeding anyway...');
+                break;
+              }
+            }
+            
+            if (waitedMinutes >= MAX_WAIT_MINUTES) {
+              core.setFailed('Queue wait timeout exceeded');
+            }
+
+  # JOB 3: Salesforce Authentication
+  authenticate-sf:
+    name: 🔐 Salesforce Authentication
+    runs-on: ubuntu-latest
+    needs: [setup-and-validate, queue-monitor]
+    if: needs.setup-and-validate.outputs.has_changes == 'true'
+    
+    steps:
+      - name: 📥 Download Changed Sources
+        uses: actions/download-artifact@v4
+        with:
+          name: changed-sources
+          path: changed-sources
+      
+      - name: 🔐 Authenticate to Salesforce
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY }}
+          SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
+          SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
+          SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
+        run: |
+          # Create JWT key file
+          echo "$SF_JWT_KEY" > server.key
+          
+          # Authenticate using JWT
+          echo "Authenticating to Salesforce..."
+          sfdx auth:jwt:grant \
+            --clientid $SF_CONSUMER_KEY \
+            --jwtkeyfile server.key \
+            --username $SF_USERNAME \
+            --instanceurl $SF_INSTANCE_URL \
+            --setdefaultdevhubusername \
+            --setalias prod-org
+          
+          # Verify authentication
+          sfdx force:org:display --targetusername $SF_USERNAME
+      
+      - name: 📦 Create Deployment Package
+        run: |
+          echo "Creating deployment package..."
+          
+          if [ -d "changed-sources" ]; then
+            # Create a zip package for deployment
+            cd changed-sources
+            zip -r ../deployment-package.zip .
+            cd ..
+            echo "Package created: deployment-package.zip"
+            ls -la deployment-package.zip
+          else
+            echo "No changed sources directory found"
+            exit 1
+          fi
+
+  # JOB 4: Deployment Execution
+  deploy-to-salesforce:
+    name: 🚀 Deploy to Salesforce
+    runs-on: ubuntu-latest
+    needs: authenticate-sf
+    timeout-minutes: ${{ env.DEPLOYMENT_TIMEOUT_MINUTES }}
+    
+    steps:
+      - name: 📢 Start Deployment Notification
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const comment = `## 🚀 Salesforce Deployment Started
+            
+            **PR #${{ github.event.pull_request.number }}** deployment is now starting!
+            
+            ✅ **Status:** In Progress
+            👤 **Deployed by:** ${{ github.actor }}
+            🕒 **Started at:** ${new Date().toISOString()}
+            🔗 **View deployment:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            Tracking deployment progress...
+            `;
+            
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: ${{ github.event.pull_request.number }},
+                body: comment
+              });
+            } catch (error) {
+              console.log('Note: Could not create comment');
+            }
+      
+      - name: 📦 Deploy Delta Changes
+        id: deploy
+        env:
+          SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
+          TEST_LEVEL: RunLocalTests  # or RunSpecifiedTests, NoTestRun
+        run: |
+          echo "Starting delta deployment to Salesforce..."
+          
+          # Deploy using the package
+          DEPLOY_RESULT=$(sfdx force:source:deploy \
+            --sourcepath changed-sources \
+            --wait 60 \
+            --testlevel $TEST_LEVEL \
+            --targetusername $SF_USERNAME \
+            --json || true)
+          
+          echo "Deployment result:"
+          echo "$DEPLOY_RESULT" | jq '.' 2>/dev/null || echo "$DEPLOY_RESULT"
+          
+          # Check deployment status
+          if echo "$DEPLOY_RESULT" | grep -q '"status": 0' || echo "$DEPLOY_RESULT" | grep -q 'Deploy Succeeded'; then
+            echo "✅ Deployment successful!"
+            echo "status=success" >> $GITHUB_OUTPUT
+            
+            # Extract deployment ID for tracking
+            DEPLOYMENT_ID=$(echo "$DEPLOY_RESULT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+            if [ -n "$DEPLOYMENT_ID" ]; then
+              echo "Deployment ID: $DEPLOYMENT_ID"
+              echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ Deployment failed"
+            echo "status=failure" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: 📊 Run Apex Tests (if any)
+        if: steps.deploy.outputs.status == 'success'
+        run: |
+          echo "Running Apex tests..."
+          # You can add specific test classes if needed
+          sfdx force:apex:test:run \
+            --targetusername ${{ secrets.SF_PROD_USERNAME }} \
+            --wait 60 \
+            --resultformat json \
+            --codecoverage \
+            --outputdir test-results
+      
+      - name: 📈 Generate Deployment Report
+        if: always()
+        run: |
+          echo "## 📊 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**PR:** #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Author:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Org:** Production" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.deploy.outputs.status || 'unknown' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Completed at:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -d "changed-sources" ]; then
+            echo "**Files Deployed:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            find changed-sources -type f | sed 's|changed-sources/||' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: 📨 Send Completion Notification
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const status = '${{ steps.deploy.outputs.status }}';
+            const emoji = status === 'success' ? '✅' : '❌';
+            const title = status === 'success' ? 'Deployment Successful' : 'Deployment Failed';
+            
+            const comment = `## ${emoji} ${title}
+            
+            **PR #${{ github.event.pull_request.number }}** deployment has completed.
+            
+            📊 **Status:** ${status === 'success' ? 'Success' : 'Failed'}
+            👤 **Deployed by:** ${{ github.actor }}
+            🕒 **Completed at:** ${new Date().toISOString()}
+            🔗 **View details:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            ${status === 'success' ? '✅ Changes are now live in Salesforce Production!' : '❌ Deployment failed. Check the logs for details.'}
+            
+            ---
+            
+            **Next in queue:** Deployment will continue with the next PR automatically.
+            `;
+            
+            try {
+              // Post new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: ${{ github.event.pull_request.number }},
+                body: comment
+              });
+              
+              // Update PR labels
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: ${{ github.event.pull_request.number }},
+                labels: status === 'success' ? ['deployed-to-prod'] : ['deployment-failed']
+              });
+              
+            } catch (error) {
+              console.log('Note: Could not update PR');
+            }
+      
+      - name: 🧹 Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up temporary files..."
+          rm -rf changed-sources server.key deployment-package.zip 2>/dev/null || true
+
+  # JOB 5: Post-Deployment (Optional)
+  post-deployment:
+    name: ✅ Post-Deployment
+    runs-on: ubuntu-latest
+    needs: deploy-to-salesforce
+    if: always()
+    
+    steps:
+      - name: 📊 Update Deployment Status
+        uses: actions/github-script@v6
+        env:
+          DEPLOYMENT_STATUS: ${{ needs.deploy-to-salesforce.result }}
+        with:
+          script: |
+            // Create deployment via GitHub API
+            await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: '${{ github.event.pull_request.merge_commit_sha }}',
+              environment: 'production',
+              auto_merge: false,
+              description: `Salesforce deployment for PR #${{ github.event.pull_request.number }}`,
+              required_contexts: []
+            });
+            
+            console.log('Deployment status updated in GitHub');
+      
+      - name: 📝 Update README Status
+        if: success()
+        run: |
+          echo "Updating deployment history..."
+          # You can log to a file or database
+          echo "$(date): PR #${{ github.event.pull_request.number }} deployed by ${{ github.actor }}" >> deployment-history.log
+
+# Job Dependencies Visualization:
+# setup-and-validate → queue-monitor → authenticate-sf → deploy-to-salesforce → post-deployment
