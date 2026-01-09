@@ -13,7 +13,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Get all history, not just latest
     
       - name: Install SFDX
         run: npm install -g sfdx-cli
@@ -26,9 +29,28 @@ jobs:
     
       - name: Deploy changed Apex files
         run: |
-          BASE=${{ github.event.pull_request.base.sha }}
+          # Get the commit BEFORE the PR merge (parent of merge commit)
+          BASE=$(git log --pretty=format:"%H" -1 ${{ github.event.pull_request.merge_commit_sha }}^)
           HEAD=${{ github.event.pull_request.merge_commit_sha }}
-          CHANGED=$(git diff --name-only $BASE $HEAD | grep '\.cls$')
-          if [ -n "$CHANGED" ]; then
-            sfdx force:source:deploy --sourcepath "$CHANGED" --targetusername "${{ secrets.SF_USERNAME }}"
+          
+          echo "Comparing $BASE..$HEAD"
+          
+          # Get changed .cls files
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
+          
+          if [ -z "$CHANGED" ]; then
+            echo "No Apex class changes found"
+            exit 0
           fi
+          
+          echo "Changed Apex files:"
+          echo "$CHANGED"
+          
+          # Deploy each file
+          for file in $CHANGED; do
+            echo "Deploying: $file"
+            sfdx force:source:deploy \
+              --sourcepath "$file" \
+              --targetusername "${{ secrets.SF_USERNAME }}" \
+              --wait 10
+          done
