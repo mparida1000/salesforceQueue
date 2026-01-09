@@ -10,13 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      # 1. THE QUEUE MANAGER
-      # This replaces the concurrency block. It will wait for previous runs to finish
-      # instead of letting GitHub cancel this one.
+      # 1. This pauses the job so they run one-by-one
       - name: Wait for previous deployments
         uses: softprops/turnstyle@v1
-        with:
-          poll-interval-seconds: 10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -26,7 +22,8 @@ jobs:
           fetch-depth: 0
       
       - name: Setup Salesforce CLI
-        run: npm install -g @salesforce/cli@latest
+        run: |
+          npm install -g @salesforce/cli@latest
       
       - name: Authenticate to Salesforce
         run: |
@@ -41,20 +38,31 @@ jobs:
 
       - name: Find and deploy changed Apex files
         run: |
-          SHA=${{ github.event.pull_request.merge_commit_sha }}
+          # Use the EXACT merge commit from the PR event
+          # This is the "secret sauce" that makes it work even if other PRs merged in the meantime
+          HEAD=${{ github.event.pull_request.merge_commit_sha }}
           
-          # Extract changed .cls files from this specific merge commit
-          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$SHA" | grep '\.cls$' | xargs | sed 's/ /,/g' || echo "")
+          # This is your original logic for finding the base (parent)
+          BASE=$(git log --pretty=format:"%H" -1 $HEAD^)
+          
+          echo "Base commit: $BASE"
+          echo "Head commit: $HEAD"
+          
+          # Your original grep logic
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
           
           if [ -z "$CHANGED" ]; then
-            echo "No Apex changes found in this merge."
+            echo "No Apex changes found"
             exit 0
           fi
           
-          echo "Deploying files for PR #${{ github.event.pull_request.number }}: $CHANGED"
+          echo "Changed files:"
+          echo "$CHANGED"
           
+          # Deploying using your original command
+          # Note: We use xargs to make sure the list is formatted correctly for the CLI
           sf project deploy start \
-            --metadata "$CHANGED" \
+            --source-dir $(echo $CHANGED | tr '\n' ' ') \
             --target-org github-action \
             --wait 30 \
             --test-level NoTestRun
