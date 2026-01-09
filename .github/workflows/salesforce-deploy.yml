@@ -4,107 +4,69 @@ on:
     types: [closed]
     branches: [dev]
 
-# QUEUE SYSTEM
-concurrency:
-  group: salesforce-deploy
-  cancel-in-progress: false
-
-env:
-  SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
-  SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
-  SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
-  SF_SERVER_KEY: ${{ secrets.SF_JWT_KEY }}
-
 jobs:
   deploy:
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     
     steps:
+      # 1. This pauses the job so they run one-by-one
+      - name: Wait for previous deployments
+        uses: softprops/turnstyle@v1
+        with:
+          # This ensures it waits for ANY other run of "Deploy Apex"
+          poll-interval-seconds: 10
+          continue-on-error: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      
-      - name: Install Salesforce CLI
-        run: npm install -g @salesforce/cli@latest
-      
-      - name: Verify Salesforce CLI
-        run: sf --version
-      
-      - name: Create JWT key file
+      - name: Setup Salesforce CLI
         run: |
-          echo "Creating JWT key file..."
-          echo "${{ secrets.SF_JWT_KEY }}" > server.key
-          ls -la server.key
-          head -2 server.key
+          npm install -g @salesforce/cli@latest
       
       - name: Authenticate to Salesforce
         run: |
-          echo "Authenticating with JWT..."
-          
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
           sf auth jwt grant \
-            --client-id ${{ secrets.SF_CONSUMER_KEY }} \
-            --username ${{ secrets.SF_PROD_USERNAME }} \
+            --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
+            --username "${{ secrets.SF_PROD_USERNAME }}" \
             --jwt-key-file server.key \
-            --instance-url ${{ secrets.SF_INSTANCE_URL }} \
+            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
             --alias github-action
-          
-          echo "✅ Authentication successful!"
-          
-          # Verify authentication
-          echo "Connected orgs:"
-          sf org list
-      
-      - name: Find changed Apex files
-        id: find-files
+          rm -f server.key
+
+      - name: Find and deploy changed Apex files
         run: |
-          BASE=$(git log --pretty=format:"%H" -1 ${{ github.event.pull_request.merge_commit_sha }}^)
+          # Use the EXACT merge commit from the PR event
+          # This is the "secret sauce" that makes it work even if other PRs merged in the meantime
           HEAD=${{ github.event.pull_request.merge_commit_sha }}
+          
+          # This is your original logic for finding the base (parent)
+          BASE=$(git log --pretty=format:"%H" -1 $HEAD^)
           
           echo "Base commit: $BASE"
           echo "Head commit: $HEAD"
           
+          # Your original grep logic
           CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
           
           if [ -z "$CHANGED" ]; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
             echo "No Apex changes found"
-          else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "Changed files:"
-            echo "$CHANGED"
-            
-            # Save to file
-            echo "$CHANGED" > changed-files.txt
+            exit 0
           fi
-      
-      - name: Deploy changed files
-        if: steps.find-files.outputs.has_changes == 'true'
-        run: |
-          echo "Starting deployment..."
           
-          # Read files from saved list
-          FILES=$(cat changed-files.txt)
+          echo "Changed files:"
+          echo "$CHANGED"
           
-          # Convert to comma-separated list
-          FILE_LIST=$(echo "$FILES" | tr '\n' ',')
-          FILE_LIST=${FILE_LIST%,}
-          
-          echo "Deploying files: $FILE_LIST"
-          
+          # Deploying using your original command
+          # Note: We use xargs to make sure the list is formatted correctly for the CLI
           sf project deploy start \
-            --source-dir "$FILE_LIST" \
+            --source-dir $(echo $CHANGED | tr '\n' ' ') \
             --target-org github-action \
             --wait 30 \
             --test-level NoTestRun
-          
-          echo "✅ Deployment completed!"
-      
-      - name: Cleanup
-        if: always()
-        run: rm -f server.key changed-files.txt
