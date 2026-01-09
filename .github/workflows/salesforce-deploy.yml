@@ -10,60 +10,13 @@ env:
   SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
 
 jobs:
-  queue-check:
-    runs-on: ubuntu-latest
-    outputs:
-      can_deploy: ${{ steps.check.outputs.can_deploy }}
-    steps:
-      - name: Install GitHub CLI
-        run: |
-          # Download and install GitHub CLI directly
-          curl -sLO https://github.com/cli/cli/releases/download/v2.47.0/gh_2.47.0_linux_amd64.tar.gz
-          tar -xzf gh_2.47.0_linux_amd64.tar.gz
-          sudo cp gh_2.47.0_linux_amd64/bin/gh /usr/local/bin/
-          gh --version
-      
-      - name: Check for running deployments
-        id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "=== QUEUE CHECK ==="
-          echo "PR #: ${{ github.event.pull_request.number }}"
-          
-          # Wait up to 10 minutes
-          MAX_WAIT=600
-          WAIT_INTERVAL=10
-          waited=0
-          
-          while [ $waited -lt $MAX_WAIT ]; do
-            echo ""
-            echo "Wait time: ${waited}s"
-            
-            # Simple check: count "in_progress" runs
-            RUNNING_COUNT=$(gh run list --repo="${{ github.repository }}" --status=in_progress --limit=5 --json status --jq 'length' 2>/dev/null || echo "0")
-            
-            if [ "$RUNNING_COUNT" -eq "0" ]; then
-              echo "✅ No deployments running"
-              echo "can_deploy=true" >> $GITHUB_OUTPUT
-              break
-            else
-              echo "⏳ $RUNNING_COUNT deployment(s) running"
-              echo "Waiting $WAIT_INTERVAL seconds..."
-              sleep $WAIT_INTERVAL
-              waited=$((waited + WAIT_INTERVAL))
-            fi
-          done
-          
-          if [ $waited -ge $MAX_WAIT ]; then
-            echo "⚠️ Timeout - proceeding anyway"
-            echo "can_deploy=true" >> $GITHUB_OUTPUT
-          fi
-
   deploy:
-    needs: queue-check
-    if: needs.queue-check.outputs.can_deploy == 'true'
     runs-on: ubuntu-latest
+    
+    # SIMPLE QUEUE - This is all you need
+    concurrency:
+      group: salesforce-deployments
+      cancel-in-progress: false
     
     steps:
       - name: Checkout code
@@ -71,13 +24,10 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      
-      - name: Install Salesforce CLI
-        run: npm install -g @salesforce/cli@latest
+      - name: Setup Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli@latest
+          sf --version
       
       - name: Create JWT key file
         run: |
@@ -96,9 +46,9 @@ jobs:
           
           echo "✅ Authentication successful!"
       
-      - name: Find changed Apex files
-        id: find-files
+      - name: Find and deploy changed Apex files
         run: |
+          # Find changed files
           BASE=$(git log --pretty=format:"%H" -1 ${{ github.event.pull_request.merge_commit_sha }}^)
           HEAD=${{ github.event.pull_request.merge_commit_sha }}
           
@@ -108,27 +58,16 @@ jobs:
           CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
           
           if [ -z "$CHANGED" ]; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
             echo "No Apex changes found"
-          else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "Changed files:"
-            echo "$CHANGED"
-            echo "$CHANGED" > changed-files.txt
+            exit 0
           fi
-      
-      - name: Deploy changed files
-        if: steps.find-files.outputs.has_changes == 'true'
-        run: |
-          echo "Starting deployment..."
           
-          FILES=$(cat changed-files.txt)
-          FILE_LIST=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
+          echo "Changed files:"
+          echo "$CHANGED"
           
-          echo "Deploying files: $FILE_LIST"
-          
+          # Deploy files
           sf project deploy start \
-            --source-dir "$FILE_LIST" \
+            --source-dir "$CHANGED" \
             --target-org github-action \
             --wait 30 \
             --test-level NoTestRun
@@ -137,4 +76,4 @@ jobs:
       
       - name: Cleanup
         if: always()
-        run: rm -f server.key changed-files.txt
+        run: rm -f server.key
