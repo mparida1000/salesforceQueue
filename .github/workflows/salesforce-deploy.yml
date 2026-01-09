@@ -4,26 +4,29 @@ on:
     types: [closed]
     branches: [dev]
 
-# Move concurrency to the workflow level for better reliability
-concurrency:
-  group: salesforce-deployments
-  cancel-in-progress: false
-
 jobs:
   deploy:
-    # Only run if the PR was merged, not just closed
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     
     steps:
+      # 1. THE QUEUE MANAGER
+      # This replaces the concurrency block. It will wait for previous runs to finish
+      # instead of letting GitHub cancel this one.
+      - name: Wait for previous deployments
+        uses: softprops/turnstyle@v1
+        with:
+          poll-interval-seconds: 10
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Necessary to find the diff between commits
+          fetch-depth: 0
       
       - name: Setup Salesforce CLI
-        run: |
-          npm install -g @salesforce/cli@latest
+        run: npm install -g @salesforce/cli@latest
       
       - name: Authenticate to Salesforce
         run: |
@@ -38,28 +41,20 @@ jobs:
 
       - name: Find and deploy changed Apex files
         run: |
-          # Use the merge commit and its immediate parent
-          # This ensures we only deploy what was in THIS specific PR
           SHA=${{ github.event.pull_request.merge_commit_sha }}
           
-          echo "Processing Merge Commit: $SHA"
-          
-          # Get files changed in this merge commit specifically
-          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$SHA" | grep '\.cls$' || echo "")
+          # Extract changed .cls files from this specific merge commit
+          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$SHA" | grep '\.cls$' | xargs | sed 's/ /,/g' || echo "")
           
           if [ -z "$CHANGED" ]; then
             echo "No Apex changes found in this merge."
             exit 0
           fi
           
-          echo "Changed files to deploy:"
-          echo "$CHANGED"
-          
-          # Convert newline separated list to space separated for the CLI
-          FILES_TO_DEPLOY=$(echo $CHANGED | tr '\n' ' ')
+          echo "Deploying files for PR #${{ github.event.pull_request.number }}: $CHANGED"
           
           sf project deploy start \
-            --metadata $FILES_TO_DEPLOY \
+            --metadata "$CHANGED" \
             --target-org github-action \
             --wait 30 \
             --test-level NoTestRun
