@@ -10,10 +10,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SF_USERNAME: ${{ secrets.SF_USERNAME }}
+  SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
   SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
   SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
-  SF_SERVER_KEY: ${{ secrets.SF_SERVER_KEY }}
+  SF_SERVER_KEY: ${{ secrets.SF_JWT_KEY }}
 
 jobs:
   deploy:
@@ -39,7 +39,7 @@ jobs:
       - name: Create JWT key file
         run: |
           echo "Creating JWT key file..."
-          echo "${{ secrets.SF_SERVER_KEY }}" > server.key
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
           ls -la server.key
           head -2 server.key
       
@@ -49,7 +49,7 @@ jobs:
           
           sf auth jwt grant \
             --client-id ${{ secrets.SF_CONSUMER_KEY }} \
-            --username ${{ secrets.SF_USERNAME }} \
+            --username ${{ secrets.SF_PROD_USERNAME }} \
             --jwt-key-file server.key \
             --instance-url ${{ secrets.SF_INSTANCE_URL }} \
             --alias github-action
