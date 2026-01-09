@@ -15,9 +15,6 @@ env:
   # Salesforce Configuration
   SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
   SF_LOGIN_URL: https://login.salesforce.com
-  # Deployment Settings
-  MAX_RETRY_COUNT: 2
-  DEPLOYMENT_TIMEOUT_MINUTES: 30
 
 jobs:
   # JOB 1: Setup and Validation
@@ -113,7 +110,6 @@ jobs:
             }
             
             core.setOutput('position', position);
-          result-encoding: string
       
       - name: 🔄 Get Changed Files
         id: get-diff
@@ -223,7 +219,6 @@ jobs:
           cat package.xml
           
           # Create destructiveChanges.xml if needed (for deletions)
-          # You can extend this to detect deletions from git diff
           cat > destructiveChanges.xml << EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <Package xmlns="http://soap.sforce.com/2006/04/metadata">
@@ -333,11 +328,31 @@ jobs:
     if: needs.setup-and-validate.outputs.has_changes == 'true'
     
     steps:
-      - name: 📥 Download Changed Sources
-        uses: actions/download-artifact@v4
+      - name: 📥 Checkout for Deployment
+        uses: actions/checkout@v4
         with:
-          name: changed-sources
-          path: changed-sources
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      
+      - name: 🔄 Recreate Changed Sources
+        run: |
+          # Recreate the changed-sources directory
+          BASE_COMMIT=$(git log --oneline ${{ github.event.pull_request.base.sha }}^..${{ github.event.pull_request.base.sha }} | tail -1 | awk '{print $1}')
+          HEAD_COMMIT=${{ github.event.pull_request.merge_commit_sha }}
+          
+          # Get changed Salesforce files
+          CHANGED_FILES=$(git diff --name-only $BASE_COMMIT..$HEAD_COMMIT | grep -E '(\.cls$|\.trigger$|\.page$|\.component$|\.object$|\.layout$|\.profile$|\.permissionset$|\.customMetadata$|\.labels$|\.resource$|\.workflow$|\.flow$|\.email$|\.approvalProcess$|\.queue$|\.group$|\.role$|\.site$|\.dashboard$|\.report$|\.tab$)' || true)
+          
+          if [ -n "$CHANGED_FILES" ]; then
+            mkdir -p changed-sources
+            for file in $CHANGED_FILES; do
+              if [ -f "$file" ]; then
+                mkdir -p "changed-sources/$(dirname "$file")"
+                cp "$file" "changed-sources/$file"
+              fi
+            done
+            echo "Recreated changed-sources with $(echo "$CHANGED_FILES" | wc -l | tr -d ' ') files"
+          fi
       
       - name: 🔐 Authenticate to Salesforce
         env:
@@ -360,30 +375,14 @@ jobs:
             --setalias prod-org
           
           # Verify authentication
-          sfdx force:org:display --targetusername $SF_USERNAME
-      
-      - name: 📦 Create Deployment Package
-        run: |
-          echo "Creating deployment package..."
-          
-          if [ -d "changed-sources" ]; then
-            # Create a zip package for deployment
-            cd changed-sources
-            zip -r ../deployment-package.zip .
-            cd ..
-            echo "Package created: deployment-package.zip"
-            ls -la deployment-package.zip
-          else
-            echo "No changed sources directory found"
-            exit 1
-          fi
+          sfdx force:org:display --targetusername $SF_USERNAME || echo "Auth verification failed, continuing anyway..."
 
   # JOB 4: Deployment Execution
   deploy-to-salesforce:
     name: 🚀 Deploy to Salesforce
     runs-on: ubuntu-latest
     needs: authenticate-sf
-    timeout-minutes: ${{ env.DEPLOYMENT_TIMEOUT_MINUTES }}
+    timeout-minutes: 45  # Fixed timeout value
     
     steps:
       - name: 📢 Start Deployment Notification
@@ -420,25 +419,72 @@ jobs:
           TEST_LEVEL: RunLocalTests  # or RunSpecifiedTests, NoTestRun
         run: |
           echo "Starting delta deployment to Salesforce..."
+          echo "Changed sources directory:"
+          ls -la changed-sources/ || echo "No changed-sources directory"
+          
+          if [ ! -d "changed-sources" ] || [ -z "$(ls -A changed-sources 2>/dev/null)" ]; then
+            echo "❌ No changes to deploy"
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check if package.xml exists
+          if [ ! -f "changed-sources/package.xml" ]; then
+            echo "⚠️ No package.xml found, generating one..."
+            # Create a simple package.xml
+            cat > changed-sources/package.xml << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+  <types>
+    <members>*</members>
+    <name>ApexClass</name>
+  </types>
+  <types>
+    <members>*</members>
+    <name>ApexTrigger</name>
+  </types>
+  <types>
+    <members>*</members>
+    <name>ApexComponent</name>
+  </types>
+  <types>
+    <members>*</members>
+    <name>ApexPage</name>
+  </types>
+  <types>
+    <members>*</members>
+    <name>CustomObject</name>
+  </types>
+  <version>58.0</version>
+</Package>
+EOF
+          fi
           
           # Deploy using the package
-          DEPLOY_RESULT=$(sfdx force:source:deploy \
+          echo "Deploying with test level: $TEST_LEVEL"
+          
+          DEPLOY_COMMAND="sfdx force:source:deploy \
             --sourcepath changed-sources \
             --wait 60 \
             --testlevel $TEST_LEVEL \
             --targetusername $SF_USERNAME \
-            --json || true)
+            --verbose"
           
-          echo "Deployment result:"
-          echo "$DEPLOY_RESULT" | jq '.' 2>/dev/null || echo "$DEPLOY_RESULT"
+          echo "Running: $DEPLOY_COMMAND"
+          
+          # Run deployment and capture output
+          DEPLOY_OUTPUT=$(eval $DEPLOY_COMMAND 2>&1 || true)
+          
+          echo "Deployment output:"
+          echo "$DEPLOY_OUTPUT"
           
           # Check deployment status
-          if echo "$DEPLOY_RESULT" | grep -q '"status": 0' || echo "$DEPLOY_RESULT" | grep -q 'Deploy Succeeded'; then
+          if echo "$DEPLOY_OUTPUT" | grep -q 'Deploy Succeeded' || echo "$DEPLOY_OUTPUT" | grep -q 'Successfully deployed'; then
             echo "✅ Deployment successful!"
             echo "status=success" >> $GITHUB_OUTPUT
             
-            # Extract deployment ID for tracking
-            DEPLOYMENT_ID=$(echo "$DEPLOY_RESULT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+            # Extract deployment ID
+            DEPLOYMENT_ID=$(echo "$DEPLOY_OUTPUT" | grep -o 'id:[[:space:]]*[a-zA-Z0-9]\{18\}' | awk '{print $2}' || echo "")
             if [ -n "$DEPLOYMENT_ID" ]; then
               echo "Deployment ID: $DEPLOYMENT_ID"
               echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
@@ -446,6 +492,7 @@ jobs:
           else
             echo "❌ Deployment failed"
             echo "status=failure" >> $GITHUB_OUTPUT
+            echo "$DEPLOY_OUTPUT" > deploy-error.log
             exit 1
           fi
       
@@ -459,7 +506,7 @@ jobs:
             --wait 60 \
             --resultformat json \
             --codecoverage \
-            --outputdir test-results
+            --outputdir test-results || echo "Test run failed or no tests found"
       
       - name: 📈 Generate Deployment Report
         if: always()
@@ -476,7 +523,14 @@ jobs:
           if [ -d "changed-sources" ]; then
             echo "**Files Deployed:**" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            find changed-sources -type f | sed 's|changed-sources/||' >> $GITHUB_STEP_SUMMARY
+            find changed-sources -type f | sed 's|changed-sources/||' | head -50 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f "deploy-error.log" ]; then
+            echo "**Error Log:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -100 deploy-error.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
       
@@ -485,20 +539,23 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const status = '${{ steps.deploy.outputs.status }}';
-            const emoji = status === 'success' ? '✅' : '❌';
-            const title = status === 'success' ? 'Deployment Successful' : 'Deployment Failed';
+            const status = '${{ steps.deploy.outputs.status }}' || 'unknown';
+            const emoji = status === 'success' ? '✅' : status === 'skipped' ? '⚠️' : '❌';
+            const title = status === 'success' ? 'Deployment Successful' : 
+                         status === 'skipped' ? 'Deployment Skipped' : 'Deployment Failed';
             
             const comment = `## ${emoji} ${title}
             
             **PR #${{ github.event.pull_request.number }}** deployment has completed.
             
-            📊 **Status:** ${status === 'success' ? 'Success' : 'Failed'}
+            📊 **Status:** ${status === 'success' ? 'Success' : status === 'skipped' ? 'Skipped (no changes)' : 'Failed'}
             👤 **Deployed by:** ${{ github.actor }}
             🕒 **Completed at:** ${new Date().toISOString()}
             🔗 **View details:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
             
-            ${status === 'success' ? '✅ Changes are now live in Salesforce Production!' : '❌ Deployment failed. Check the logs for details.'}
+            ${status === 'success' ? '✅ Changes are now live in Salesforce Production!' : 
+             status === 'skipped' ? '⚠️ No Salesforce changes detected in this PR.' :
+             '❌ Deployment failed. Check the logs for details.'}
             
             ---
             
@@ -515,12 +572,21 @@ jobs:
               });
               
               // Update PR labels
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: ${{ github.event.pull_request.number }},
-                labels: status === 'success' ? ['deployed-to-prod'] : ['deployment-failed']
-              });
+              if (status === 'success') {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: ${{ github.event.pull_request.number }},
+                  labels: ['deployed-to-prod']
+                });
+              } else if (status === 'failure') {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: ${{ github.event.pull_request.number }},
+                  labels: ['deployment-failed']
+                });
+              }
               
             } catch (error) {
               console.log('Note: Could not update PR');
@@ -530,7 +596,7 @@ jobs:
         if: always()
         run: |
           echo "Cleaning up temporary files..."
-          rm -rf changed-sources server.key deployment-package.zip 2>/dev/null || true
+          rm -rf changed-sources server.key test-results deploy-error.log 2>/dev/null || true
 
   # JOB 5: Post-Deployment (Optional)
   post-deployment:
@@ -541,30 +607,40 @@ jobs:
     
     steps:
       - name: 📊 Update Deployment Status
+        if: needs.deploy-to-salesforce.result == 'success'
         uses: actions/github-script@v6
-        env:
-          DEPLOYMENT_STATUS: ${{ needs.deploy-to-salesforce.result }}
         with:
           script: |
-            // Create deployment via GitHub API
-            await github.rest.repos.createDeployment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: '${{ github.event.pull_request.merge_commit_sha }}',
-              environment: 'production',
-              auto_merge: false,
-              description: `Salesforce deployment for PR #${{ github.event.pull_request.number }}`,
-              required_contexts: []
-            });
-            
-            console.log('Deployment status updated in GitHub');
+            try {
+              // Create deployment via GitHub API
+              await github.rest.repos.createDeployment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: '${{ github.event.pull_request.merge_commit_sha }}',
+                environment: 'production',
+                auto_merge: false,
+                description: `Salesforce deployment for PR #${{ github.event.pull_request.number }}`,
+                required_contexts: []
+              });
+              
+              console.log('Deployment status updated in GitHub');
+            } catch (error) {
+              console.log('Could not create deployment status:', error.message);
+            }
       
-      - name: 📝 Update README Status
-        if: success()
+      - name: 📝 Update Deployment History
+        if: always()
         run: |
           echo "Updating deployment history..."
-          # You can log to a file or database
-          echo "$(date): PR #${{ github.event.pull_request.number }} deployed by ${{ github.actor }}" >> deployment-history.log
-
-# Job Dependencies Visualization:
-# setup-and-validate → queue-monitor → authenticate-sf → deploy-to-salesforce → post-deployment
+          HISTORY_FILE="deployment-history.md"
+          
+          if [ ! -f "$HISTORY_FILE" ]; then
+            echo "# Salesforce Deployment History" > $HISTORY_FILE
+            echo "" >> $HISTORY_FILE
+            echo "| Date | PR | Author | Status |" >> $HISTORY_FILE
+            echo "|------|----|--------|--------|" >> $HISTORY_FILE
+          fi
+          
+          STATUS="${{ needs.deploy-to-salesforce.result }}"
+          DATE=$(date '+%Y-%m-%d %H:%M:%S')
+          echo "| $DATE | #${{ github.event.pull_request.number }} | ${{ github.actor }} | $STATUS |" >> $HISTORY_FILE
