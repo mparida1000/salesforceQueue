@@ -1,6 +1,6 @@
 public class ChatGptHandler {
 
-    private static String CHAT_GPT_KEY = '';
+
     private static final String ENDPOINT ='https://api.openai.com/v1/completions';
     
     //@method   : getQueryData
