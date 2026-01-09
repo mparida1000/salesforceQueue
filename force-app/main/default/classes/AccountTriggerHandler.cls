@@ -2,7 +2,7 @@ public class AccountTriggerHandler {
 
     public static void handleDistributorOptions(List<Account> newAccounts, Map<Id, Account> oldAccountsMap) {
         if (System.Label.enableStateChangeCleanup.equals('Y') && oldAccountsMap != null) {
-            System.debug('222');
+            System.debug('2222');
             handleStateChangeCleanup(newAccounts, oldAccountsMap);
         }
         createDistributorOptions(newAccounts, oldAccountsMap);
