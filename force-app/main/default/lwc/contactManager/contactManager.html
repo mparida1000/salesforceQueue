@@ -1,0 +1,42 @@
+<template>
+    <lightning-card title="Contact Manager">
+        <!-- Contact Creation Form -->
+        <lightning-record-edit-form object-api-name="Contact" onsuccess={handleSuccess}>
+            <lightning-messages></lightning-messages>
+            
+            <lightning-input-field field-name="FirstName"></lightning-input-field>
+            <lightning-input-field field-name="LastName"></lightning-input-field>
+            <!-- Account Lookup Field -->
+            <lightning-input-field field-name="AccountId" required onchange={handleAccountChange}></lightning-input-field>
+            <lightning-input-field field-name="MailingStreet"></lightning-input-field>
+            <lightning-input-field field-name="MailingCity"></lightning-input-field>
+            <lightning-input-field field-name="MailingState"></lightning-input-field>
+            <lightning-input-field field-name="MailingPostalCode"></lightning-input-field>
+            <lightning-button class="slds-m-top_small" variant="brand" type="submit" label="Create Contact"></lightning-button>
+        </lightning-record-edit-form>
+
+        <!-- Contact List -->
+        <template if:true={contacts}>
+            <lightning-datatable
+                key-field="Id"
+                data={contacts}
+                columns={columns}
+                onsort={handleSort}
+                sorted-by={sortedBy}
+                sorted-direction={sortedDirection}
+                default-sort-direction="asc">
+            </lightning-datatable>
+        </template>
+        <template if:false={contacts}>
+            <p>No contacts found for the selected account.</p>
+        </template>
+
+        <!-- Pagination Controls -->
+        <template if:true={contacts}>
+            <div class="slds-m-top_medium">
+                <lightning-button label="Previous" onclick={previousPage} disabled={isFirstPage}></lightning-button>
+                <lightning-button label="Next" onclick={nextPage} disabled={isLastPage}></lightning-button>
+            </div>
+        </template>
+    </lightning-card>
+</template>

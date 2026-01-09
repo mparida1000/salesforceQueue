@@ -1,0 +1,14 @@
+<aura:component implements="force:appHostable,flexipage:availableForAllPageTypes,flexipage:availableForRecordHome,force:hasRecordId,forceCommunity:availableForAllPageTypes" access="global" >
+	<aura:attribute name="years" type="Integer" default="1"/>
+    <aura:attribute name="principalAmount" type="Decimal" default="100"/>
+    <aura:attribute name="interestRate" type="Decimal" default="1"/>
+    <aura:attribute name="totalAmount" type="Decimal" default="0"/>
+    
+	<div class="slds-page-header slds-text-heading--medium slds-m-bottom_medium">Compound Interest Calculator</div>
+    <lightning:input type="number" name="principal" label="Principal" formatter="currency" step="0.01" onchange="{!c.principalChanged}"/>
+    <lightning:input type="number" name="interest" label="Interest rate %" formatter="percent" step="0.01" onchange="{!c.interestChanged}"/>
+    <lightning:slider label="Years" value="{!v.years}" max="10" onchange="{!c.yearChanged}"/>
+    Your Returns<br/>
+    $<ui:outputText value="{!v.totalAmount}"/>
+   
+</aura:component>

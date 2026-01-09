@@ -1,0 +1,22 @@
+<aura:component> 
+    
+    <div class="slds-size_6-of-12 slds-align_absolute-center">
+        
+        
+        
+        <lightning:card iconName="standard:contact" title="Compound Interest Calculator">
+            <div class="slds-p-around_medium">
+                <lightning:layout>
+                    <lightning:layoutItem size="12" padding="around-small">
+                        <lightning:input type="number" aura:id="principal" label="Principal" value=""/>
+                        <lightning:input type="interest" aura:id="int" label="Interest Rate %" value=""/>
+                        <lightning:slider aura:id="slider" label="Years" value="5" max="10"/>
+                        <lightning:input type="number" aura:id="returns" label="Your Returns" value="" readonly="true"/>
+                        <lightning:button variant="brand" label="Calculate" title="calculate" onclick="{! c.calculate }" />
+                    </lightning:layoutItem> 
+                </lightning:layout>
+            </div>
+        </lightning:card>
+        
+    </div>
+</aura:component>

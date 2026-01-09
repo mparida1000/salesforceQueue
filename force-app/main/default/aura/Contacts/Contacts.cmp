@@ -1,0 +1,53 @@
+<aura:component controller="AccountsController" Implements="flexipage:availableForRecordHome,force:hasRecordId" >
+    
+    <aura:attribute name="contacts" type="List" />
+    
+    <aura:handler name="init" value="{!this}" action="{!c.doInit}" />
+    <!-- Use a data table from the Lightning Design System: https://www.lightningdesignsystem.com/components/data-tables/ -->
+    <table class="slds-table slds-table_bordered slds-table_striped slds-table_cell-buffer slds-table_fixed-layout">
+        <thead>
+            <tr class="slds-text-heading_label">
+                <th scope="col"><div class="slds-truncate" title="ID">ID</div></th>
+                <th scope="col"><div class="slds-truncate" title="Name">Name</div></th>
+                <th scope="col"><div class="slds-truncate" title="Email">Email</div></th>
+                <th scope="col"><div class="slds-truncate" title="Phone">Phone</div></th>
+                <th scope="col"><div class="slds-truncate" title="Active__c">Active</div></th>
+                <th scope="col"><div class="slds-truncate" title="Switch">Switch</div></th>
+                
+            </tr>
+        </thead>
+        <tbody>
+            <!-- Use the Apex model and controller to fetch server side data -->
+            <aura:iteration items="{!v.contacts}" var="contact">
+                <tr>
+                    <th scope="row"><div class="slds-truncate" title="{!contact.Id}">{!contact.Id}</div></th>
+                    <td><div class="slds-truncate" title="{!contact.Name}">{!contact.Name}</div></td>
+                    <td><div class="slds-truncate" title="{!contact.Email}">{!contact.Email}</div></td>
+                    <td><div class="slds-truncate" title="{!contact.Phone}">{!contact.Phone}</div></td>
+                    <td><div class="slds-truncate" title="{!contact.Active__c}">{!contact.Active__c}</div></td>
+                    <td>
+                        <div class="slds-m-around--large">
+                            <!--PART 1 for create toggle switch/checkbox form element-->    
+                            <div class="slds-form-element">
+                                <label class="slds-checkbox_toggle slds-grid">
+                                    <span class="slds-form-element__label slds-m-bottom_none"></span>
+                                    <ui:inputCheckbox change="{!c.selectChange}" name="{!contact.Id}" value="{!contact.Active__c}"/>
+                                    
+                                    <span id="toggle-desc" class="slds-checkbox_faux_container" aria-live="assertive">
+                                        <span class="slds-checkbox_faux"></span>
+                                        <span class="slds-checkbox_on">Active</span>
+                                        <span class="slds-checkbox_off">Inactive</span>
+                                    </span>
+                                    
+                                </label>
+                            </div>
+                            
+                        </div>
+                        
+                    </td>
+                    
+                </tr>
+            </aura:iteration>
+        </tbody>
+    </table>
+</aura:component>
