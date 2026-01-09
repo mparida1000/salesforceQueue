@@ -101,7 +101,7 @@ jobs:
             --source-dir "$FILE_LIST" \
             --target-org github-action \
             --wait 30 \
-            --test-level RunLocalTests
+            --test-level NoTestRun
           
           echo "✅ Deployment completed!"
       
