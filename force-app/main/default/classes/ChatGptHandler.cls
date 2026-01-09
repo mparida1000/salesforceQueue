@@ -1,6 +1,6 @@
 public class ChatGptHandler {
 
-    private static String CHAT_GPT_KEY = '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';//OpenAiKey__c.getValues('keyValue').Key__c; //Custom Setting
+    private static String CHAT_GPT_KEY = '';//OpenAiKey__c.getValues('keyValue').Key__c; //Custom Setting
     private static final String ENDPOINT ='https://api.openai.com/v1/completions';
     
     //@method   : getQueryData
