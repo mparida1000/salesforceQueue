@@ -4,76 +4,62 @@ on:
     types: [closed]
     branches: [dev]
 
-env:
-  SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
-  SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
-  SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
+# Move concurrency to the workflow level for better reliability
+concurrency:
+  group: salesforce-deployments
+  cancel-in-progress: false
 
 jobs:
   deploy:
+    # Only run if the PR was merged, not just closed
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-    
-    # SIMPLE QUEUE - This is all you need
-    concurrency:
-      group: salesforce-deployments
-      cancel-in-progress: true
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Necessary to find the diff between commits
       
       - name: Setup Salesforce CLI
         run: |
           npm install -g @salesforce/cli@latest
-          sf --version
-      
-      - name: Create JWT key file
-        run: |
-          echo "${{ secrets.SF_JWT_KEY }}" > server.key
-          echo "JWT key created"
       
       - name: Authenticate to Salesforce
         run: |
-          echo "Authenticating to Salesforce..."
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
           sf auth jwt grant \
             --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
             --username "${{ secrets.SF_PROD_USERNAME }}" \
             --jwt-key-file server.key \
             --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
             --alias github-action
-          
-          echo "✅ Authentication successful!"
-      
+          rm -f server.key
+
       - name: Find and deploy changed Apex files
         run: |
-          # Find changed files
-          BASE=$(git log --pretty=format:"%H" -1 ${{ github.event.pull_request.merge_commit_sha }}^)
-          HEAD=${{ github.event.pull_request.merge_commit_sha }}
+          # Use the merge commit and its immediate parent
+          # This ensures we only deploy what was in THIS specific PR
+          SHA=${{ github.event.pull_request.merge_commit_sha }}
           
-          echo "Base commit: $BASE"
-          echo "Head commit: $HEAD"
+          echo "Processing Merge Commit: $SHA"
           
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
+          # Get files changed in this merge commit specifically
+          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$SHA" | grep '\.cls$' || echo "")
           
           if [ -z "$CHANGED" ]; then
-            echo "No Apex changes found"
+            echo "No Apex changes found in this merge."
             exit 0
           fi
           
-          echo "Changed files:"
+          echo "Changed files to deploy:"
           echo "$CHANGED"
           
-          # Deploy files
+          # Convert newline separated list to space separated for the CLI
+          FILES_TO_DEPLOY=$(echo $CHANGED | tr '\n' ' ')
+          
           sf project deploy start \
-            --source-dir "$CHANGED" \
+            --metadata $FILES_TO_DEPLOY \
             --target-org github-action \
             --wait 30 \
             --test-level NoTestRun
-          
-          echo "✅ Deployment completed!"
-      
-      - name: Cleanup
-        if: always()
-        run: rm -f server.key
