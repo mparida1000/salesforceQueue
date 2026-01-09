@@ -4,9 +4,9 @@ name: Deploy Apex
 on:
   pull_request:
     types: [closed]
-    branches: [dev, test]
+    branches: [main]
 
-# QUEUE MAGIC HAPPENS HERE
+# QUEUE: This line creates the automatic queue
 concurrency:
   group: apex-deploy
   cancel-in-progress: false
@@ -14,44 +14,139 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
-      - uses: salesforceactions/setup-sfdx@v4
+      - name: Setup Node.js (required for Salesforce CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
       
-      - name: Authenticate
+      - name: Install Salesforce CLI
         run: |
-          echo "${{ secrets.SF_JWT_KEY }}" > server.key
-          sfdx auth:jwt:grant \
-            --clientid "${{ secrets.SF_CONSUMER_KEY }}" \
-            --jwtkeyfile server.key \
-            --username "${{ secrets.SF_USERNAME }}" \
-            --instanceurl "${{ secrets.SF_INSTANCE_URL }}"
+          npm install -g sfdx-cli
+          sfdx --version
       
-      - name: Deploy changed Apex
+      - name: Authenticate to Salesforce
+        env:
+          SF_JWT_KEY: ${{ secrets.SF_JWT_KEY }}
+          SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
+          SF_USERNAME: ${{ secrets.SF_USERNAME }}
+          SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
+        run: |
+          # Create JWT key file (assuming secret contains the private key directly, not base64)
+          echo "$SF_JWT_KEY" > server.key
+          
+          # Authenticate using JWT
+          sfdx auth:jwt:grant \
+            --clientid "$SF_CONSUMER_KEY" \
+            --jwtkeyfile server.key \
+            --username "$SF_USERNAME" \
+            --instanceurl "$SF_INSTANCE_URL" \
+            --setalias prod
+          
+          # Verify authentication
+          sfdx org:list
+      
+      - name: Find changed Apex files
+        id: find-changes
         run: |
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.event.pull_request.merge_commit_sha }}
           
-          # Create directory for changed files
-          mkdir -p changed-apex
+          echo "Looking for changes between $BASE and $HEAD"
           
-          # Find and copy changed .cls files
-          git diff --name-only $BASE $HEAD | while read file; do
-            if [[ $file == *.cls ]]; then
-              mkdir -p "changed-apex/$(dirname "$file")"
-              cp "$file" "changed-apex/$file"
+          # Get list of changed .cls files
+          CHANGED_FILES=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
+          
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No Apex class changes found"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Found Apex changes:"
+          echo "$CHANGED_FILES"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          
+          # Save file list for debugging
+          echo "$CHANGED_FILES" > changed-files.txt
+      
+      - name: Deploy changed Apex classes
+        if: steps.find-changes.outputs.has_changes == 'true'
+        run: |
+          echo "Preparing to deploy Apex changes..."
+          
+          # Create deployment directory
+          mkdir -p deploy-package/classes
+          
+          # Read changed files
+          CHANGED_FILES=$(cat changed-files.txt)
+          
+          # Copy each changed file
+          for file in $CHANGED_FILES; do
+            if [ -f "$file" ]; then
+              CLASS_NAME=$(basename "$file" .cls)
+              
+              # Copy the Apex class
+              cp "$file" "deploy-package/classes/$CLASS_NAME.cls"
+              
+              # Try to copy the metadata file if it exists
+              if [ -f "$file-meta.xml" ]; then
+                cp "$file-meta.xml" "deploy-package/classes/$CLASS_NAME.cls-meta.xml"
+              else
+                # Create minimal metadata file
+                cat > "deploy-package/classes/$CLASS_NAME.cls-meta.xml" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>58.0</apiVersion>
+    <status>Active</status>
+</ApexClass>
+EOF
+              fi
+              
+              echo "Added: $CLASS_NAME"
             fi
           done
           
-          # Deploy if we found files
-          if [ -n "$(find changed-apex -name '*.cls')" ]; then
-            echo "Deploying Apex changes..."
-            sfdx force:source:deploy \
-              --sourcepath changed-apex \
-              --targetusername "${{ secrets.SF_USERNAME }}"
-          else
-            echo "No Apex changes to deploy"
-          fi
+          # Create package.xml
+          cat > deploy-package/package.xml << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+  <types>
+EOF
+          
+          # Add each class to package.xml
+          for file in $CHANGED_FILES; do
+            CLASS_NAME=$(basename "$file" .cls)
+            echo "    <members>$CLASS_NAME</members>" >> deploy-package/package.xml
+          done
+          
+          cat >> deploy-package/package.xml << 'EOF'
+    <name>ApexClass</name>
+  </types>
+  <version>58.0</version>
+</Package>
+EOF
+          
+          echo "Package.xml created"
+          cat deploy-package/package.xml
+          
+          # Deploy using mdapi format
+          echo "Converting to MDAPI format..."
+          sfdx force:source:convert \
+            --rootdir deploy-package \
+            --outputdir mdapi-package
+          
+          echo "Deploying to Salesforce..."
+          sfdx force:mdapi:deploy \
+            --deploydir mdapi-package \
+            --targetusername "${{ secrets.SF_USERNAME }}" \
+            --wait 30 \
+            --testlevel RunLocalTests
+          
+          echo "✅ Deployment completed!"
