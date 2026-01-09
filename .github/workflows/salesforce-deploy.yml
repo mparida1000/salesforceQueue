@@ -4,7 +4,6 @@ on:
     types: [closed]
     branches: [dev]
 
-# THIS LINE CREATES THE QUEUE
 concurrency:
   group: salesforce-deploy
   cancel-in-progress: false
@@ -24,103 +23,109 @@ jobs:
         with:
           node-version: '20'
     
-      - name: Install latest Salesforce CLI
-        run: npm install -g @salesforce/cli@latest
-    
-      - name: Verify SFDX installation
-        run: sf --version
-    
-      - name: Create JWT key file
-        id: create-key
+      - name: Install Salesforce CLI (legacy)
         run: |
-          echo "Creating JWT key file..."
-          echo "${{ secrets.SF_JWT_KEY }}" > server.key
+          npm install -g sfdx-cli@latest
+          sfdx --version
+    
+      - name: Create and validate JWT key
+        run: |
+          echo "Creating JWT key..."
           
-          # Verify key file was created
-          if [ -f "server.key" ]; then
-            echo "✅ JWT key file created"
-            ls -la server.key
+          # Check if secret is base64 encoded
+          if echo "${{ secrets.SF_JWT_KEY }}" | base64 -d > /dev/null 2>&1; then
+            echo "Key appears to be base64 encoded, decoding..."
+            echo "${{ secrets.SF_JWT_KEY }}" | base64 -d > server.key
           else
-            echo "❌ Failed to create JWT key file"
+            echo "${{ secrets.SF_JWT_KEY }}" > server.key
+          fi
+          
+          # Verify key
+          if [ -s "server.key" ]; then
+            echo "✅ Key file created successfully"
+            echo "First 100 chars of key:"
+            head -c 100 server.key
+          else
+            echo "❌ Key file is empty"
             exit 1
           fi
     
-      - name: Authenticate to Salesforce
+      - name: Authenticate with verification
         id: auth
         run: |
-          echo "Starting Salesforce authentication..."
+          echo "Attempting authentication..."
           
-          # Print debug info (without exposing secrets)
-          echo "Username: ${{ secrets.SF_USERNAME }}"
-          echo "Instance URL: ${{ secrets.SF_INSTANCE_URL }}"
-          echo "Consumer Key length: ${#SF_CONSUMER_KEY} chars"
-          
-          # Authenticate using JWT
-          sf org login jwt \
-            --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
-            --jwt-key-file server.key \
+          # Try authentication
+          AUTH_OUTPUT=$(sfdx auth:jwt:grant \
+            --clientid "${{ secrets.SF_CONSUMER_KEY }}" \
+            --jwtkeyfile server.key \
             --username "${{ secrets.SF_USERNAME }}" \
-            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
-            --alias prod-org \
-            --set-default
+            --instanceurl "${{ secrets.SF_INSTANCE_URL }}" \
+            --setdefaultdevhubusername \
+            --setalias prod-org 2>&1)
           
-          # Verify authentication was successful
-          echo "✅ Authentication successful!"
+          AUTH_EXIT_CODE=$?
           
-          # List orgs to confirm
-          echo "Connected orgs:"
-          sf org list
+          echo "Authentication output:"
+          echo "$AUTH_OUTPUT"
+          
+          if [ $AUTH_EXIT_CODE -eq 0 ]; then
+            echo "✅ Authentication successful!"
+            
+            # Verify we can access the org
+            echo "Verifying org access..."
+            sfdx force:org:display --targetusername "${{ secrets.SF_USERNAME }}" || \
+            sfdx force:org:display --targetusername prod-org
+          else
+            echo "❌ Authentication failed with exit code: $AUTH_EXIT_CODE"
+            echo "Debug info:"
+            echo "Consumer Key starts with: ${SF_CONSUMER_KEY:0:10}..."
+            echo "Username: ${{ secrets.SF_USERNAME }}"
+            echo "Instance URL: ${{ secrets.SF_INSTANCE_URL }}"
+            exit 1
+          fi
     
-      - name: Get changed Apex files
-        id: get-changes
+      - name: Find changed files
+        id: find-files
         run: |
-          # Get the commit BEFORE the PR merge (parent of merge commit)
           BASE=$(git log --pretty=format:"%H" -1 ${{ github.event.pull_request.merge_commit_sha }}^)
           HEAD=${{ github.event.pull_request.merge_commit_sha }}
           
-          echo "Comparing $BASE..$HEAD"
-          
-          # Get changed .cls files
           CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
           
           if [ -z "$CHANGED" ]; then
-            echo "No Apex class changes found"
             echo "has_changes=false" >> $GITHUB_OUTPUT
-            exit 0
+            echo "No changes"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Files: $CHANGED"
+            
+            # Save to file for deployment
+            echo "$CHANGED" > files-to-deploy.txt
           fi
-          
-          echo "Changed Apex files:"
-          echo "$CHANGED"
-          echo "has_changes=true" >> $GITHUB_OUTPUT
-          echo "changed_files=$CHANGED" >> $GITHUB_OUTPUT
     
-      - name: Deploy changed Apex files
-        if: steps.get-changes.outputs.has_changes == 'true'
+      - name: Deploy files
+        if: steps.find-files.outputs.has_changes == 'true'
         run: |
-          echo "Starting Salesforce deployment..."
+          echo "Reading files to deploy..."
+          FILES=$(cat files-to-deploy.txt)
           
-          # Get the changed files from previous step
-          CHANGED_FILES="${{ steps.get-changes.outputs.changed_files }}"
+          # Create deployment package
+          mkdir -p deploy-package
           
-          # Convert newlines to commas for SFDX
-          COMMA_SEPARATED=$(echo "$CHANGED_FILES" | tr '\n' ',')
+          for file in $FILES; do
+            if [ -f "$file" ]; then
+              mkdir -p "deploy-package/$(dirname "$file")"
+              cp "$file" "deploy-package/$file"
+              echo "Added: $file"
+            fi
+          done
           
-          # Remove trailing comma if exists
-          COMMA_SEPARATED=${COMMA_SEPARATED%,}
-          
-          echo "Files to deploy: $COMMA_SEPARATED"
-          
-          # Deploy using the new SF command
-          sf project deploy start \
-            --source-dir "$COMMA_SEPARATED" \
-            --target-org prod-org \
+          # Deploy
+          echo "Starting deployment..."
+          sfdx force:source:deploy \
+            --sourcepath deploy-package \
+            --targetusername "${{ secrets.SF_USERNAME }}" \
             --wait 30 \
+            --testlevel RunLocalTests \
             --verbose
-          
-          echo "✅ Deployment completed successfully!"
-    
-      - name: Cleanup
-        if: always()
-        run: |
-          echo "Cleaning up temporary files..."
-          rm -f server.key 2>/dev/null || true
