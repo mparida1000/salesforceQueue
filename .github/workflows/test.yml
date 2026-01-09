@@ -1,0 +1,65 @@
+name: Deploy Apex
+on:
+  pull_request:
+    types: [closed]
+    branches: [dev]
+
+# Move concurrency to the workflow level for better reliability
+concurrency:
+  group: salesforce-deployments
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Only run if the PR was merged, not just closed
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Necessary to find the diff between commits
+      
+      - name: Setup Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli@latest
+      
+      - name: Authenticate to Salesforce
+        run: |
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
+          sf auth jwt grant \
+            --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
+            --username "${{ secrets.SF_PROD_USERNAME }}" \
+            --jwt-key-file server.key \
+            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
+            --alias github-action
+          rm -f server.key
+
+      - name: Find and deploy changed Apex files
+        run: |
+          # Use the merge commit and its immediate parent
+          # This ensures we only deploy what was in THIS specific PR
+          SHA=${{ github.event.pull_request.merge_commit_sha }}
+          
+          echo "Processing Merge Commit: $SHA"
+          
+          # Get files changed in this merge commit specifically
+          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$SHA" | grep '\.cls$' || echo "")
+          
+          if [ -z "$CHANGED" ]; then
+            echo "No Apex changes found in this merge."
+            exit 0
+          fi
+          
+          echo "Changed files to deploy:"
+          echo "$CHANGED"
+          
+          # Convert newline separated list to space separated for the CLI
+          FILES_TO_DEPLOY=$(echo $CHANGED | tr '\n' ' ')
+          
+          sf project deploy start \
+            --metadata $FILES_TO_DEPLOY \
+            --target-org github-action \
+            --wait 30 \
+            --test-level NoTestRun
