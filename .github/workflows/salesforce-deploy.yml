@@ -1,62 +1,72 @@
 # .github/workflows/salesforce-deploy.yml
-name: 🚀 Salesforce Deployment Queue
+name: Salesforce Deployment Queue
 
 on:
   pull_request:
     types: [closed]
-    branches: [dev, main, master]
+    branches: [main, master]
 
-# QUEUE CONFIGURATION
+# QUEUE IMPLEMENTATION: Only one deployment runs at a time
 concurrency:
-  group: sfdc-prod-deploy-${{ github.event.pull_request.base.ref }}
+  group: sfdc-apex-deploy
   cancel-in-progress: false
 
+env:
+  SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
+
 jobs:
-  setup:
-    name: 🔍 Setup & Validate
+  check-changes:
+    name: Check for Apex Changes
     runs-on: ubuntu-latest
     outputs:
-      has_changes: ${{ steps.check-changes.outputs.has_changes }}
+      has_apex_changes: ${{ steps.check.outputs.has_apex_changes }}
+      changed_files: ${{ steps.check.outputs.changed_files }}
     
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.merge_commit_sha }}
       
-      - name: 🔧 Setup Salesforce CLI
-        uses: salesforceactions/setup-sfdx@v4
-      
-      - name: 🔍 Check for Salesforce Changes
-        id: check-changes
+      - name: Check for Apex class changes
+        id: check
         run: |
-          BASE_COMMIT=${{ github.event.pull_request.base.sha }}
-          HEAD_COMMIT=${{ github.event.pull_request.merge_commit_sha }}
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.merge_commit_sha }}
           
-          # Check for any Salesforce metadata files
-          if git diff --name-only $BASE_COMMIT..$HEAD_COMMIT | grep -qE '\.(cls|trigger|page|component|object|layout|profile|permissionset)$'; then
-            echo "Salesforce changes detected"
-            echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "Checking changes between: $BASE_SHA and $HEAD_SHA"
+          
+          # Get changed Apex classes
+          APEX_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '\.cls$' || true)
+          
+          if [ -n "$APEX_FILES" ]; then
+            echo "Found Apex changes:"
+            echo "$APEX_FILES"
+            echo "has_apex_changes=true" >> $GITHUB_OUTPUT
+            echo "changed_files=$APEX_FILES" >> $GITHUB_OUTPUT
           else
-            echo "No Salesforce changes"
-            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No Apex class changes found"
+            echo "has_apex_changes=false" >> $GITHUB_OUTPUT
+            echo "changed_files=" >> $GITHUB_OUTPUT
           fi
       
-      - name: 📊 Queue Status
-        if: steps.check-changes.outputs.has_changes == 'true'
+      - name: Create queue status comment
+        if: steps.check.outputs.has_apex_changes == 'true'
         uses: actions/github-script@v6
         with:
           script: |
-            // Create initial queue comment
             const comment = `## ⏳ Salesforce Deployment Queue
             
-            **PR #${{ github.event.pull_request.number }}** added to deployment queue.
+            **PR #${{ github.event.pull_request.number }}** has been added to the deployment queue.
             
             👤 **Requested by:** ${{ github.actor }}
-            🔗 **View queue:** https://github.com/${{ github.repository }}/actions/workflows/${{ github.workflow }}
+            📊 **Apex changes:** ${{ steps.check.outputs.changed_files.split('\n').length }} file(s)
+            🔗 **View queue:** https://github.com/${{ github.repository }}/actions
             
-            This deployment will start automatically when previous deployments complete.
+            **Queue Status:** Waiting (Previous deployments will complete first)
+            
+            This deployment will start automatically when ready.
             `;
             
             try {
@@ -67,172 +77,235 @@ jobs:
                 body: comment
               });
             } catch (error) {
-              console.log('Could not create comment');
+              console.log('Could not create comment:', error.message);
             }
 
-  deploy:
-    name: 🚀 Deploy to Salesforce
+  deploy-apex:
+    name: Deploy Apex Classes
     runs-on: ubuntu-latest
-    needs: setup
-    if: needs.setup.outputs.has_changes == 'true'
+    needs: check-changes
+    if: needs.check-changes.outputs.has_apex_changes == 'true'
     timeout-minutes: 30
     
     steps:
-      - name: 📥 Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.merge_commit_sha }}
       
-      - name: 🔧 Setup Salesforce CLI
+      - name: Setup Salesforce CLI
         uses: salesforceactions/setup-sfdx@v4
       
-      - name: 🔐 Authenticate to Salesforce
+      - name: Authenticate to Salesforce
         env:
           SF_JWT_KEY: ${{ secrets.SF_JWT_KEY }}
           SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
-          SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
           SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
         run: |
-          echo "$SF_JWT_KEY" | base64 -d > server.key
+          # Create JWT key file from base64 encoded secret
+          echo "$SF_JWT_KEY" > server.key
+          
+          # Authenticate to Salesforce
+          echo "Authenticating to Salesforce..."
           sfdx auth:jwt:grant \
-            --clientid $SF_CONSUMER_KEY \
+            --clientid "$SF_CONSUMER_KEY" \
             --jwtkeyfile server.key \
-            --username $SF_USERNAME \
-            --instanceurl $SF_INSTANCE_URL \
+            --username "$SF_USERNAME" \
+            --instanceurl "$SF_INSTANCE_URL" \
             --setalias prod-org
       
-      - name: 📝 Prepare Delta Deployment
+      - name: Prepare Apex deployment package
+        id: prepare
         run: |
-          BASE_COMMIT=${{ github.event.pull_request.base.sha }}
-          HEAD_COMMIT=${{ github.event.pull_request.merge_commit_sha }}
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.merge_commit_sha }}
           
-          # Get list of changed Salesforce files
-          CHANGED_FILES=$(git diff --name-only $BASE_COMMIT..$HEAD_COMMIT)
-          echo "Changed files:"
-          echo "$CHANGED_FILES"
+          echo "Preparing deployment package..."
           
-          # Filter for Salesforce files and create deployment directory
-          mkdir -p deploy-package
+          # Create deployment directory
+          mkdir -p apex-to-deploy
           
-          # Copy changed Salesforce files
-          for file in $CHANGED_FILES; do
-            if [[ $file =~ \.(cls|trigger|page|component|object|layout|profile|permissionset)$ ]] && [ -f "$file" ]; then
-              mkdir -p "deploy-package/$(dirname "$file")"
-              cp "$file" "deploy-package/$file"
-              echo "Added: $file"
+          # Get changed Apex classes
+          APEX_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '\.cls$' || true)
+          
+          # Copy each changed Apex class
+          for file in $APEX_FILES; do
+            if [ -f "$file" ]; then
+              # Get class name (without .cls extension)
+              CLASS_NAME=$(basename "$file" .cls)
+              
+              # Create directory structure
+              mkdir -p "apex-to-deploy/$(dirname "$file")"
+              
+              # Copy the Apex class file
+              cp "$file" "apex-to-deploy/$file"
+              
+              # Also copy the meta.xml file if it exists
+              if [ -f "$file-meta.xml" ]; then
+                cp "$file-meta.xml" "apex-to-deploy/$file-meta.xml"
+              fi
+              
+              echo "Added: $CLASS_NAME"
             fi
           done
           
-          # Create package.xml if we have files
-          if [ -n "$(find deploy-package -type f -name '*.cls' -o -name '*.trigger' -o -name '*.page' -o -name '*.component')" ]; then
-            cat > deploy-package/package.xml << 'EOF'
+          # Create package.xml for Apex classes
+          if [ -n "$APEX_FILES" ]; then
+            cat > apex-to-deploy/package.xml << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
   <types>
-    <members>*</members>
+EOF
+            
+            # Add each Apex class to package.xml
+            for file in $APEX_FILES; do
+              CLASS_NAME=$(basename "$file" .cls)
+              echo "    <members>$CLASS_NAME</members>" >> apex-to-deploy/package.xml
+            done
+            
+            cat >> apex-to-deploy/package.xml << 'EOF'
     <name>ApexClass</name>
-  </types>
-  <types>
-    <members>*</members>
-    <name>ApexTrigger</name>
-  </types>
-  <types>
-    <members>*</members>
-    <name>ApexPage</name>
-  </types>
-  <types>
-    <members>*</members>
-    <name>ApexComponent</name>
-  </types>
-  <types>
-    <members>*</members>
-    <name>CustomObject</name>
-  </types>
-  <types>
-    <members>*</members>
-    <name>Layout</name>
-  </types>
-  <types>
-    <members>*</members>
-    <name>Profile</name>
-  </types>
-  <types>
-    <members>*</members>
-    <name>PermissionSet</name>
   </types>
   <version>58.0</version>
 </Package>
 EOF
-            echo "Created package.xml"
+            
+            echo "Created package.xml with $(echo "$APEX_FILES" | wc -l) Apex classes"
+            
+            # List files in deployment package
+            echo "Files to deploy:"
+            find apex-to-deploy -type f | sort
           fi
       
-      - name: 🚀 Deploy Changes
-        id: deployment
+      - name: Deploy Apex classes to Salesforce
+        id: deploy
         run: |
-          if [ ! -d "deploy-package" ] || [ -z "$(ls -A deploy-package 2>/dev/null)" ]; then
-            echo "No files to deploy"
+          echo "Starting Salesforce deployment..."
+          
+          # Check if we have files to deploy
+          if [ ! -d "apex-to-deploy" ] || [ -z "$(ls -A apex-to-deploy/*.cls 2>/dev/null)" ]; then
+            echo "❌ No Apex classes to deploy"
             echo "status=skipped" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          echo "Deploying Salesforce changes..."
+          echo "Deploying Apex classes to Salesforce..."
           
           # Deploy using SFDX
-          sfdx force:source:deploy \
-            --sourcepath deploy-package \
+          DEPLOY_CMD="sfdx force:source:deploy \
+            --sourcepath apex-to-deploy \
             --wait 30 \
             --testlevel RunLocalTests \
-            --targetusername ${{ secrets.SF_PROD_USERNAME }} \
-            --json > deploy-result.json
+            --targetusername \"$SF_USERNAME\" \
+            --json"
           
-          # Check deployment result
-          if jq -e '.status == 0' deploy-result.json > /dev/null 2>&1; then
+          echo "Running: $DEPLOY_CMD"
+          
+          # Execute deployment and capture output
+          DEPLOY_OUTPUT=$(eval $DEPLOY_CMD 2>&1 || true)
+          
+          echo "Deployment output:"
+          echo "$DEPLOY_OUTPUT"
+          
+          # Check if deployment succeeded
+          if echo "$DEPLOY_OUTPUT" | grep -q '"status": 0' || echo "$DEPLOY_OUTPUT" | grep -q 'Deploy Succeeded'; then
             echo "✅ Deployment successful!"
             echo "status=success" >> $GITHUB_OUTPUT
             
-            # Get deployment details
-            DEPLOYMENT_ID=$(jq -r '.result.id' deploy-result.json)
-            echo "Deployment ID: $DEPLOYMENT_ID"
+            # Extract deployment ID if available
+            DEPLOYMENT_ID=$(echo "$DEPLOY_OUTPUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+            if [ -n "$DEPLOYMENT_ID" ]; then
+              echo "Deployment ID: $DEPLOYMENT_ID"
+              echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+            fi
           else
             echo "❌ Deployment failed"
-            cat deploy-result.json
             echo "status=failure" >> $GITHUB_OUTPUT
             exit 1
           fi
       
-      - name: 📨 Update PR Status
+      - name: Update PR with deployment result
         if: always()
         uses: actions/github-script@v6
         with:
           script: |
-            const status = '${{ steps.deployment.outputs.status }}';
-            const emoji = status === 'success' ? '✅' : status === 'skipped' ? '⚠️' : '❌';
+            const status = '${{ steps.deploy.outputs.status }}' || 'unknown';
+            const prNumber = ${{ github.event.pull_request.number }};
+            const actor = '${{ github.actor }}';
+            const changedFiles = '${{ needs.check-changes.outputs.changed_files }}'.split('\n').filter(f => f);
             
-            const comment = `## ${emoji} Deployment ${status}
+            let emoji, title, message;
             
-            **PR #${{ github.event.pull_request.number }}** deployment completed.
-            
-            **Status:** ${status.toUpperCase()}
-            **By:** ${{ github.actor }}
-            **Time:** ${new Date().toLocaleString()}
-            
-            ${status === 'success' ? 'Changes deployed to Salesforce successfully!' :
-             status === 'skipped' ? 'No Salesforce changes to deploy.' :
-             'Deployment failed. Check workflow logs for details.'}
-            `;
+            if (status === 'success') {
+              emoji = '✅';
+              title = 'Deployment Successful';
+              message = `## ${emoji} ${title}\n\n`;
+              message += `**PR #${prNumber}** has been successfully deployed to Salesforce.\n\n`;
+              message += `👤 **Deployed by:** ${actor}\n`;
+              message += `🕒 **Completed:** ${new Date().toLocaleString()}\n`;
+              message += `📊 **Apex classes deployed:** ${changedFiles.length}\n\n`;
+              
+              if (changedFiles.length > 0) {
+                message += `**Files deployed:**\n`;
+                changedFiles.forEach(file => {
+                  const className = file.split('/').pop().replace('.cls', '');
+                  message += `- ${className}\n`;
+                });
+              }
+              
+              message += `\n✅ Changes are now live in Salesforce!`;
+              
+            } else if (status === 'failure') {
+              emoji = '❌';
+              title = 'Deployment Failed';
+              message = `## ${emoji} ${title}\n\n`;
+              message += `**PR #${prNumber}** deployment failed.\n\n`;
+              message += `👤 **Attempted by:** ${actor}\n`;
+              message += `🕒 **Time:** ${new Date().toLocaleString()}\n`;
+              message += `🔗 **View logs:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\n\n`;
+              message += `❌ Check the workflow logs for error details.`;
+              
+            } else {
+              emoji = '⚠️';
+              title = 'No Deployment Needed';
+              message = `## ${emoji} ${title}\n\n`;
+              message += `**PR #${prNumber}** had no Apex class changes to deploy.\n\n`;
+              message += `👤 **Checked by:** ${actor}\n`;
+              message += `🕒 **Time:** ${new Date().toLocaleString()}`;
+            }
             
             try {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: ${{ github.event.pull_request.number }},
-                body: comment
+                issue_number: prNumber,
+                body: message
               });
+              
+              // Add label based on status
+              if (status === 'success') {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: ['deployed-to-prod']
+                });
+              } else if (status === 'failure') {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: ['deployment-failed']
+                });
+              }
+              
             } catch (error) {
-              console.log('Could not update PR');
+              console.log('Could not update PR:', error.message);
             }
       
-      - name: 🧹 Cleanup
+      - name: Cleanup
         if: always()
-        run: rm -rf deploy-package server.key deploy-result.json
+        run: |
+          rm -rf apex-to-deploy server.key 2>/dev/null || true
+          echo "Cleanup complete"
