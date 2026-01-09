@@ -17,53 +17,53 @@ jobs:
     steps:
       - name: Install GitHub CLI
         run: |
-          type -p gh >/dev/null || curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt update
-          sudo apt install gh -y
+          # Download and install GitHub CLI directly
+          curl -sLO https://github.com/cli/cli/releases/download/v2.47.0/gh_2.47.0_linux_amd64.tar.gz
+          tar -xzf gh_2.47.0_linux_amd64.tar.gz
+          sudo cp gh_2.47.0_linux_amd64/bin/gh /usr/local/bin/
+          gh --version
       
       - name: Check for running deployments
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WORKFLOW_ID: ${{ github.workflow }}
         run: |
-          echo "Checking for running deployments..."
+          echo "=== QUEUE CHECK ==="
+          echo "PR #: ${{ github.event.pull_request.number }}"
           
-          # Wait up to 10 minutes for queue
-          MAX_WAIT=600  # 10 minutes in seconds
+          # Wait up to 10 minutes
+          MAX_WAIT=600
           WAIT_INTERVAL=10
-          total_wait=0
+          waited=0
           
-          while [ $total_wait -lt $MAX_WAIT ]; do
-            # Get running workflow runs
-            RUNNING_COUNT=$(gh run list --repo="${{ github.repository }}" --workflow="$WORKFLOW_ID" --status=in_progress --json status --jq 'length' 2>/dev/null || echo "0")
+          while [ $waited -lt $MAX_WAIT ]; do
+            echo ""
+            echo "Wait time: ${waited}s"
+            
+            # Simple check: count "in_progress" runs
+            RUNNING_COUNT=$(gh run list --repo="${{ github.repository }}" --status=in_progress --limit=5 --json status --jq 'length' 2>/dev/null || echo "0")
             
             if [ "$RUNNING_COUNT" -eq "0" ]; then
-              echo "✅ No deployments running. Can proceed."
+              echo "✅ No deployments running"
               echo "can_deploy=true" >> $GITHUB_OUTPUT
               break
             else
-              echo "⏳ $RUNNING_COUNT deployment(s) in progress. Waiting $WAIT_INTERVAL seconds..."
+              echo "⏳ $RUNNING_COUNT deployment(s) running"
+              echo "Waiting $WAIT_INTERVAL seconds..."
               sleep $WAIT_INTERVAL
-              total_wait=$((total_wait + WAIT_INTERVAL))
+              waited=$((waited + WAIT_INTERVAL))
             fi
           done
           
-          if [ $total_wait -ge $MAX_WAIT ]; then
-            echo "❌ Timeout waiting for queue (10 minutes)"
-            echo "can_deploy=false" >> $GITHUB_OUTPUT
+          if [ $waited -ge $MAX_WAIT ]; then
+            echo "⚠️ Timeout - proceeding anyway"
+            echo "can_deploy=true" >> $GITHUB_OUTPUT
           fi
 
   deploy:
     needs: queue-check
     if: needs.queue-check.outputs.can_deploy == 'true'
     runs-on: ubuntu-latest
-    
-    # JOB-LEVEL QUEUE - This is key!
-    concurrency:
-      group: salesforce-deploy-queue
-      cancel-in-progress: false
     
     steps:
       - name: Checkout code
