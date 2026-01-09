@@ -4,128 +4,107 @@ on:
     types: [closed]
     branches: [dev]
 
+# QUEUE SYSTEM
 concurrency:
   group: salesforce-deploy
   cancel-in-progress: false
+
+env:
+  SF_USERNAME: ${{ secrets.SF_USERNAME }}
+  SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
+  SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
+  SF_SERVER_KEY: ${{ secrets.SF_SERVER_KEY }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout with full history
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-    
-      - name: Setup Node.js 20
+      
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-    
-      - name: Install Salesforce CLI (legacy)
+      
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli@latest
+      
+      - name: Verify Salesforce CLI
+        run: sf --version
+      
+      - name: Create JWT key file
         run: |
-          npm install -g sfdx-cli@latest
-          sfdx --version
-    
-      - name: Create and validate JWT key
+          echo "Creating JWT key file..."
+          echo "${{ secrets.SF_SERVER_KEY }}" > server.key
+          ls -la server.key
+          head -2 server.key
+      
+      - name: Authenticate to Salesforce
         run: |
-          echo "Creating JWT key..."
+          echo "Authenticating with JWT..."
           
-          # Check if secret is base64 encoded
-          if echo "${{ secrets.SF_JWT_KEY }}" | base64 -d > /dev/null 2>&1; then
-            echo "Key appears to be base64 encoded, decoding..."
-            echo "${{ secrets.SF_JWT_KEY }}" | base64 -d > server.key
-          else
-            echo "${{ secrets.SF_JWT_KEY }}" > server.key
-          fi
+          sf auth jwt grant \
+            --client-id ${{ secrets.SF_CONSUMER_KEY }} \
+            --username ${{ secrets.SF_USERNAME }} \
+            --jwt-key-file server.key \
+            --instance-url ${{ secrets.SF_INSTANCE_URL }} \
+            --alias github-action
           
-          # Verify key
-          if [ -s "server.key" ]; then
-            echo "✅ Key file created successfully"
-            echo "First 100 chars of key:"
-            head -c 100 server.key
-          else
-            echo "❌ Key file is empty"
-            exit 1
-          fi
-    
-      - name: Authenticate with verification
-        id: auth
-        run: |
-          echo "Attempting authentication..."
+          echo "✅ Authentication successful!"
           
-          # Try authentication
-          AUTH_OUTPUT=$(sfdx auth:jwt:grant \
-            --clientid "${{ secrets.SF_CONSUMER_KEY }}" \
-            --jwtkeyfile server.key \
-            --username "${{ secrets.SF_USERNAME }}" \
-            --instanceurl "${{ secrets.SF_INSTANCE_URL }}" \
-            --setdefaultdevhubusername \
-            --setalias prod-org 2>&1)
-          
-          AUTH_EXIT_CODE=$?
-          
-          echo "Authentication output:"
-          echo "$AUTH_OUTPUT"
-          
-          if [ $AUTH_EXIT_CODE -eq 0 ]; then
-            echo "✅ Authentication successful!"
-            
-            # Verify we can access the org
-            echo "Verifying org access..."
-            sfdx force:org:display --targetusername "${{ secrets.SF_USERNAME }}" || \
-            sfdx force:org:display --targetusername prod-org
-          else
-            echo "❌ Authentication failed with exit code: $AUTH_EXIT_CODE"
-            echo "Debug info:"
-            echo "Consumer Key starts with: ${SF_CONSUMER_KEY:0:10}..."
-            echo "Username: ${{ secrets.SF_USERNAME }}"
-            echo "Instance URL: ${{ secrets.SF_INSTANCE_URL }}"
-            exit 1
-          fi
-    
-      - name: Find changed files
+          # Verify authentication
+          echo "Connected orgs:"
+          sf org list
+      
+      - name: Find changed Apex files
         id: find-files
         run: |
           BASE=$(git log --pretty=format:"%H" -1 ${{ github.event.pull_request.merge_commit_sha }}^)
           HEAD=${{ github.event.pull_request.merge_commit_sha }}
           
+          echo "Base commit: $BASE"
+          echo "Head commit: $HEAD"
+          
           CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
           
           if [ -z "$CHANGED" ]; then
             echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "No changes"
+            echo "No Apex changes found"
           else
             echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "Files: $CHANGED"
+            echo "Changed files:"
+            echo "$CHANGED"
             
-            # Save to file for deployment
-            echo "$CHANGED" > files-to-deploy.txt
+            # Save to file
+            echo "$CHANGED" > changed-files.txt
           fi
-    
-      - name: Deploy files
+      
+      - name: Deploy changed files
         if: steps.find-files.outputs.has_changes == 'true'
         run: |
-          echo "Reading files to deploy..."
-          FILES=$(cat files-to-deploy.txt)
-          
-          # Create deployment package
-          mkdir -p deploy-package
-          
-          for file in $FILES; do
-            if [ -f "$file" ]; then
-              mkdir -p "deploy-package/$(dirname "$file")"
-              cp "$file" "deploy-package/$file"
-              echo "Added: $file"
-            fi
-          done
-          
-          # Deploy
           echo "Starting deployment..."
-          sfdx force:source:deploy \
-            --sourcepath deploy-package \
-            --targetusername "${{ secrets.SF_USERNAME }}" \
+          
+          # Read files from saved list
+          FILES=$(cat changed-files.txt)
+          
+          # Convert to comma-separated list
+          FILE_LIST=$(echo "$FILES" | tr '\n' ',')
+          FILE_LIST=${FILE_LIST%,}
+          
+          echo "Deploying files: $FILE_LIST"
+          
+          sf project deploy start \
+            --source-dir "$FILE_LIST" \
+            --target-org github-action \
             --wait 30 \
-            --testlevel RunLocalTests \
-            --verbose
+            --test-level RunLocalTests
+          
+          echo "✅ Deployment completed!"
+      
+      - name: Cleanup
+        if: always()
+        run: rm -f server.key changed-files.txt
