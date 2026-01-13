@@ -1,72 +1,206 @@
-name: Deploy Apex
+name: Deploy Apex (Queued)
+
 on:
   pull_request:
     types: [closed]
     branches: [dev]
 
+env:
+  SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
+  SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
+  SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
+  SF_SERVER_KEY: ${{ secrets.SF_JWT_KEY }}
+
+  REDIS_HOST: ${{ secrets.REDIS_HOST }}
+  REDIS_PORT: ${{ secrets.REDIS_PORT }}
+  REDIS_USER: ${{ secrets.REDIS_USER }} # usually "default"
+  REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+
 jobs:
   deploy:
     if: github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
-    
-    steps:
-      # 1. This pauses the job so they run one-by-one
-      - name: Wait for previous deployments
-        uses: softprops/turnstyle@v1
-        with:
-          # This ensures it waits for ANY other run of "Deploy Apex"
-          poll-interval-seconds: 10
-          continue-on-error: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: concordia-linux-cpu2-ram7gi
+    timeout-minutes: 180
 
-      - name: Checkout code
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Setup Salesforce CLI
+
+      - name: Install redis-cli
         run: |
-          npm install -g @salesforce/cli@latest
-      
-      - name: Authenticate to Salesforce
+          sudo apt-get update
+          sudo apt-get install -y redis-tools
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli@latest
+
+      - name: Create JWT key file
         run: |
           echo "${{ secrets.SF_JWT_KEY }}" > server.key
-          sf auth jwt grant \
-            --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
-            --username "${{ secrets.SF_PROD_USERNAME }}" \
-            --jwt-key-file server.key \
-            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
-            --alias github-action
-          rm -f server.key
+          chmod 600 server.key
 
-      - name: Find and deploy changed Apex files
+      - name: Authenticate to Salesforce
         run: |
-          # Use the EXACT merge commit from the PR event
-          # This is the "secret sauce" that makes it work even if other PRs merged in the meantime
+          sf auth jwt grant \
+          --client-id ${{ secrets.SF_CONSUMER_KEY }} \
+          --username ${{ secrets.SF_PROD_USERNAME }} \
+          --jwt-key-file server.key \
+          --instance-url ${{ secrets.SF_INSTANCE_URL }} \
+          --alias github-action
+
+      - name: Find changed Apex files
+        id: find-files
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.event.pull_request.merge_commit_sha }}
-          
-          # This is your original logic for finding the base (parent)
-          BASE=$(git log --pretty=format:"%H" -1 $HEAD^)
-          
-          echo "Base commit: $BASE"
-          echo "Head commit: $HEAD"
-          
-          # Your original grep logic
+
           CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
-          
           if [ -z "$CHANGED" ]; then
-            echo "No Apex changes found"
-            exit 0
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No Apex changes"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED" > changed-files.txt
+            echo "Changed:"
+            cat changed-files.txt
           fi
-          
-          echo "Changed files:"
-          echo "$CHANGED"
-          
-          # Deploying using your original command
-          # Note: We use xargs to make sure the list is formatted correctly for the CLI
+
+      # -------------------------
+      # QUEUE ONLY AROUND DEPLOY
+      # -------------------------
+      - name: Acquire deploy slot (Redis PoC)
+        if: steps.find-files.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          REDISCLI_AUTH: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          QUEUE_KEY="sf:deploy:queue:prod"
+          LOCK_KEY="sf:deploy:lock:prod"
+          HB_PREFIX="sf:deploy:hb:"
+          LOCK_TTL_MS=60000
+          HB_TTL_SEC=90
+          SLEEP_SEC=8
+
+          MY_ID="${GITHUB_REPOSITORY}:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          MY_HB="${HB_PREFIX}${MY_ID}"
+
+          r() {
+            redis-cli --tls --insecure \
+              -h "$REDIS_HOST" -p "$REDIS_PORT" \
+              --user "$REDIS_USER" "$@"
+          }
+
+          cleanup() {
+            echo "Cleanup..."
+            OWNER="$(r GET "$LOCK_KEY" || true)"
+            if [ "${OWNER:-}" = "$MY_ID" ]; then r DEL "$LOCK_KEY" >/dev/null || true; fi
+            r DEL "$MY_HB" >/dev/null || true
+            r LREM "$QUEUE_KEY" 0 "$MY_ID" >/dev/null || true
+          }
+          trap cleanup EXIT
+
+          echo "Enqueue $MY_ID"
+          r SET "$MY_HB" "1" EX "$HB_TTL_SEC" >/dev/null
+          r RPUSH "$QUEUE_KEY" "$MY_ID" >/dev/null
+
+          while true; do
+            HEAD="$(r LINDEX "$QUEUE_KEY" 0 || true)"
+            LOCK_OWNER="$(r GET "$LOCK_KEY" || true)"
+
+            # Pop stale head (no heartbeat) if it isn't holding the lock
+            if [ -n "${HEAD:-}" ]; then
+              HEAD_HB="$(r GET "${HB_PREFIX}${HEAD}" || true)"
+              if [ "$HEAD" != "$MY_ID" ] && [ -z "${HEAD_HB:-}" ] && [ "${LOCK_OWNER:-}" != "$HEAD" ]; then
+                echo "Stale head $HEAD; popping..."
+                r LPOP "$QUEUE_KEY" >/dev/null || true
+                continue
+              fi
+            fi
+
+            if [ "$HEAD" = "$MY_ID" ]; then
+              RES="$(r SET "$LOCK_KEY" "$MY_ID" NX PX "$LOCK_TTL_MS" || true)"
+              if [ "${RES:-}" = "OK" ] || [ "${LOCK_OWNER:-}" = "$MY_ID" ]; then
+                echo "✅ Got deploy slot"
+                (
+                  while true; do
+                    CUR="$(r GET "$LOCK_KEY" || true)"
+                    [ "$CUR" = "$MY_ID" ] || exit 0
+                    r PEXPIRE "$LOCK_KEY" "$LOCK_TTL_MS" >/dev/null || true
+                    r SET "$MY_HB" "1" EX "$HB_TTL_SEC" >/dev/null || true
+                    sleep 20
+                  done
+                ) &
+                echo $! > renewer.pid
+                break
+              fi
+            fi
+
+            r SET "$MY_HB" "1" EX "$HB_TTL_SEC" >/dev/null || true
+            sleep "$SLEEP_SEC"
+          done
+
+      - name: Deploy changed Apex (queued)
+        if: steps.find-files.outputs.has_changes == 'true'
+        run: |
+          FILES=$(cat changed-files.txt)
+          FILE_LIST=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
+
           sf project deploy start \
-            --source-dir $(echo $CHANGED | tr '\n' ' ') \
-            --target-org github-action \
-            --wait 30 \
-            --test-level NoTestRun
+          --source-dir "$FILE_LIST" \
+          --target-org github-action \
+          --wait 30 \
+          --test-level NoTestRun
+
+      - name: Release deploy slot (Redis PoC)
+        if: steps.find-files.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          REDISCLI_AUTH: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          QUEUE_KEY="sf:deploy:queue:prod"
+          LOCK_KEY="sf:deploy:lock:prod"
+          HB_PREFIX="sf:deploy:hb:"
+
+          MY_ID="${GITHUB_REPOSITORY}:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          MY_HB="${HB_PREFIX}${MY_ID}"
+
+          r() {
+            redis-cli --tls --insecure \
+              -h "$REDIS_HOST" -p "$REDIS_PORT" \
+              --user "$REDIS_USER" "$@"
+          }
+
+          if [ -f renewer.pid ]; then
+            kill "$(cat renewer.pid)" >/dev/null 2>&1 || true
+            rm -f renewer.pid
+          fi
+
+          HEAD="$(r LINDEX "$QUEUE_KEY" 0 || true)"
+          if [ "$HEAD" = "$MY_ID" ]; then
+            r LPOP "$QUEUE_KEY" >/dev/null
+          else
+            r LREM "$QUEUE_KEY" 0 "$MY_ID" >/dev/null || true
+          fi
+
+          OWNER="$(r GET "$LOCK_KEY" || true)"
+          if [ "$OWNER" = "$MY_ID" ]; then
+            r DEL "$LOCK_KEY" >/dev/null
+          fi
+
+          r DEL "$MY_HB" >/dev/null || true
+          echo "✅ Released deploy slot"
+
+      - name: Cleanup files
+        if: always()
+        run: rm -f server.key changed-files.txt renewer.pid
