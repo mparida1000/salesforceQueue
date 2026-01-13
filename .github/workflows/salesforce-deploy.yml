@@ -75,6 +75,34 @@ jobs:
       # -------------------------
       # QUEUE ONLY AROUND DEPLOY
       # -------------------------
+
+      - name: Detect Redis TLS mode
+        id: redis-mode
+        shell: bash
+        env:
+          REDISCLI_AUTH: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          set -euo pipefail
+      
+          echo "Testing Redis connectivity..."
+      
+          # Try TLS first
+          if redis-cli --tls --insecure -h "${{ secrets.REDIS_HOST }}" -p "${{ secrets.REDIS_PORT }}" --user "${{ secrets.REDIS_USER }}" PING 2>/dev/null | grep -q PONG; then
+            echo "mode=TLS" >> $GITHUB_OUTPUT
+            echo "Redis mode: TLS"
+            exit 0
+          fi
+      
+          # Fall back to NON-TLS
+          if redis-cli -h "${{ secrets.REDIS_HOST }}" -p "${{ secrets.REDIS_PORT }}" --user "${{ secrets.REDIS_USER }}" PING 2>/dev/null | grep -q PONG; then
+            echo "mode=PLAIN" >> $GITHUB_OUTPUT
+            echo "Redis mode: PLAIN"
+            exit 0
+          fi
+      
+          echo "Could not connect to Redis using TLS or NON-TLS."
+          exit 1
+          
       - name: Acquire deploy slot (Redis PoC)
         if: steps.find-files.outputs.has_changes == 'true'
         shell: bash
@@ -94,9 +122,11 @@ jobs:
           MY_HB="${HB_PREFIX}${MY_ID}"
 
           r() {
-            redis-cli --tls --insecure \
-              -h "$REDIS_HOST" -p "$REDIS_PORT" \
-              --user "$REDIS_USER" "$@"
+            if [ "${{ steps.redis-mode.outputs.mode }}" = "TLS" ]; then
+            redis-cli --tls --insecure -h "$REDIS_HOST" -p "$REDIS_PORT" --user "$REDIS_USER" "$@"
+            else
+            redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" --user "$REDIS_USER" "$@"
+            fi
           }
 
           cleanup() {
@@ -176,9 +206,11 @@ jobs:
           MY_HB="${HB_PREFIX}${MY_ID}"
 
           r() {
-            redis-cli --tls --insecure \
-              -h "$REDIS_HOST" -p "$REDIS_PORT" \
-              --user "$REDIS_USER" "$@"
+            if [ "${{ steps.redis-mode.outputs.mode }}" = "TLS" ]; then
+            redis-cli --tls --insecure -h "$REDIS_HOST" -p "$REDIS_PORT" --user "$REDIS_USER" "$@"
+            else
+            redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" --user "$REDIS_USER" "$@"
+            fi
           }
 
           if [ -f renewer.pid ]; then
