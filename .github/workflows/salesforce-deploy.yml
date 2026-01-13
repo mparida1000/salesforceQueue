@@ -19,7 +19,7 @@ env:
 jobs:
   deploy:
     if: github.event.pull_request.merged == true
-    runs-on: concordia-linux-cpu2-ram7gi
+    runs-on: ubuntu-latest
     timeout-minutes: 180
 
     steps:
