@@ -3,7 +3,7 @@ name: Deploy Apex (Queued)
 on:
   pull_request:
     types: [closed]
-    branches: [develop]
+    branches: [dev]
 
 env:
   SF_USERNAME: ${{ secrets.SF_PROD_USERNAME }}
