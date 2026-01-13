@@ -55,23 +55,29 @@ jobs:
           --instance-url ${{ secrets.SF_INSTANCE_URL }} \
           --alias github-action
 
-      - name: Find changed Apex files
+      - name: Find changed Apex files (PR-only)
         id: find-files
+        shell: bash
         run: |
-          BASE=${{ github.event.pull_request.base.sha }}
-          HEAD=${{ github.event.pull_request.merge_commit_sha }}
-
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || echo "")
+          set -euo pipefail
+      
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+      
+          echo "PR BASE: $BASE"
+          echo "PR HEAD: $HEAD"
+      
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep '\.cls$' || true)
+      
           if [ -z "$CHANGED" ]; then
             echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "No Apex changes"
+            echo "No Apex changes found"
           else
             echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "$CHANGED" > changed-files.txt
-            echo "Changed:"
+            printf "%s\n" "$CHANGED" > changed-files.txt
+            echo "Changed Apex files:"
             cat changed-files.txt
           fi
-
       # -------------------------
       # QUEUE ONLY AROUND DEPLOY
       # -------------------------
@@ -178,17 +184,25 @@ jobs:
             sleep "$SLEEP_SEC"
           done
 
-      - name: Deploy changed Apex (queued)
+      - name: Deploy PR Apex changes
         if: steps.find-files.outputs.has_changes == 'true'
+        shell: bash
         run: |
-          FILES=$(cat changed-files.txt)
-          FILE_LIST=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
-
+          set -euo pipefail
+      
+          ARGS=()
+          while IFS= read -r f; do
+            [ -n "$f" ] && ARGS+=(--source-dir "$f")
+          done < changed-files.txt
+      
+          echo "Deploying:"
+          cat changed-files.txt
+      
           sf project deploy start \
-          --source-dir "$FILE_LIST" \
-          --target-org github-action \
-          --wait 30 \
-          --test-level NoTestRun
+            "${ARGS[@]}" \
+            --target-org github-action \
+            --wait 30 \
+            --test-level NoTestRun
 
       - name: Release deploy slot (Redis PoC)
         if: steps.find-files.outputs.has_changes == 'true'
