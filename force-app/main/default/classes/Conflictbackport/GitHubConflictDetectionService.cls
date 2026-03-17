@@ -1,74 +1,119 @@
 public without sharing class GitHubConflictDetectionService {
 
-    public class DetectionResult {
-        public Set < String > pr1Files = new Set < String > ();
-        public Set < String > featureConflictFiles = new Set < String > ();
-        public Set < String > r2OnlyFiles = new Set < String > ();
+    public class FileAnalysis {
+        public Integer sequence;
+        public String filePath;
+        public String previousFilePath;
+        public String changeType;
+        public String baseContent;
+        public String sourceContent;
+        public String targetContent;
+        public Boolean isConflict;
+        public Boolean isSafe;
     }
 
-    public static DetectionResult detect(
-        String owner,
-        String repo,
-        Integer pr1Number,
-        String sourceHeadSha,
-        String backportBranch,
-        String targetBranch
+    public class DetectionResult {
+        public String mergeBaseSha;
+        public List<FileAnalysis> files = new List<FileAnalysis>();
+        public Integer safeCount = 0;
+        public Integer conflictCount = 0;
+    }
+
+    public static DetectionResult detectForSession(
+            String owner,
+            String repo,
+            Integer pr1Number,
+            String sourceHeadSha,
+            String targetBranch
     ) {
         DetectionResult result = new DetectionResult();
 
-        // PR1 changed files
-        List < Map < String, Object >> pr1Rows =
-            GitHubConflictGitService.getPullRequestFiles(owner, repo, pr1Number);
-
-        for (Map < String, Object > row: pr1Rows) {
-            String filename = (String) row.get('filename');
-            if (!String.isBlank(filename)) {
-                result.pr1Files.add(filename);
-            }
-        }
-
-        // Compute merge base between PR2 source branch and target branch
-        String mergeBaseSha = GitHubConflictGitService.getMergeBaseSha(
-            owner,
-            repo,
-            targetBranch,
-            backportBranch
+        result.mergeBaseSha = GitHubConflictGitService.getMergeBaseSha(
+                owner,
+                repo,
+                targetBranch,
+                sourceHeadSha
         );
 
-        if (String.isBlank(mergeBaseSha)) {
-            System.debug('DetectionService: merge base not found.');
-            return result;
-        }
+        List<Map<String, Object>> pr1Rows =
+                GitHubConflictGitService.getPullRequestFiles(owner, repo, pr1Number);
 
-        for (String filePath: result.pr1Files) {
+        Integer seq = 1;
+
+        for (Map<String, Object> row : pr1Rows) {
+            String filePath = (String) row.get('filename');
+            String previousPath = (String) row.get('previous_filename');
+            String status = (String) row.get('status');
+
+            if (String.isBlank(filePath)) continue;
+
+            String baseLookupPath = !String.isBlank(previousPath) ? previousPath : filePath;
 
             GitHubConflictGitService.FileContentResult baseFile =
-                GitHubConflictGitService.getFileContent(owner, repo, filePath, mergeBaseSha);
+                    GitHubConflictGitService.getFileContent(
+                            owner,
+                            repo,
+                            baseLookupPath,
+                            result.mergeBaseSha
+                    );
 
-            GitHubConflictGitService.FileContentResult sourceFile =
-                GitHubConflictGitService.getFileContent(owner, repo, filePath, sourceHeadSha);
+            GitHubConflictGitService.FileContentResult sourceFile;
+            if (status == 'removed') {
+                sourceFile = new GitHubConflictGitService.FileContentResult();
+                sourceFile.exists = false;
+                sourceFile.text = '';
+            } else {
+                sourceFile = GitHubConflictGitService.getFileContent(
+                        owner,
+                        repo,
+                        filePath,
+                        sourceHeadSha
+                );
+            }
 
             GitHubConflictGitService.FileContentResult targetFile =
-                GitHubConflictGitService.getFileContent(owner, repo, filePath, targetBranch);
+                    GitHubConflictGitService.getFileContent(
+                            owner,
+                            repo,
+                            filePath,
+                            targetBranch
+                    );
 
             String baseText = (baseFile != null && baseFile.exists) ? baseFile.text : null;
             String sourceText = (sourceFile != null && sourceFile.exists) ? sourceFile.text : null;
             String targetText = (targetFile != null && targetFile.exists) ? targetFile.text : null;
 
-            Boolean sourceChanged = !same(baseText, sourceText);
-            Boolean targetChanged = !same(baseText, targetText);
-            Boolean sourceVsTargetDifferent = !same(sourceText, targetText);
+            Boolean sourceChanged = !GitHubConflictUtils.same(baseText, sourceText);
+            Boolean targetChanged = !GitHubConflictUtils.same(baseText, targetText);
+            Boolean sourceTargetDiffer = !GitHubConflictUtils.same(sourceText, targetText);
 
-            // Actual same-file conflict candidate
-            if (sourceChanged && targetChanged && sourceVsTargetDifferent) {
-                result.featureConflictFiles.add(filePath);
+            FileAnalysis fa = new FileAnalysis();
+            fa.sequence = seq++;
+            fa.filePath = filePath;
+            fa.previousFilePath = previousPath;
+            fa.changeType = status;
+            fa.baseContent = baseText == null ? '' : baseText;
+            fa.sourceContent = sourceText == null ? '' : sourceText;
+            fa.targetContent = targetText == null ? '' : targetText;
+
+            if (sourceChanged && !targetChanged) {
+                fa.isSafe = true;
+                fa.isConflict = false;
+                result.safeCount++;
+            } else if (sourceChanged && targetChanged && sourceTargetDiffer) {
+                fa.isSafe = false;
+                fa.isConflict = true;
+                result.conflictCount++;
+            } else {
+                // no-op / still safe for our current use case
+                fa.isSafe = true;
+                fa.isConflict = false;
+                result.safeCount++;
             }
+
+            result.files.add(fa);
         }
 
         return result;
-    }
-
-    private static Boolean same(String a, String b) {
-        return String.valueOf(a) == String.valueOf(b);
     }
 }

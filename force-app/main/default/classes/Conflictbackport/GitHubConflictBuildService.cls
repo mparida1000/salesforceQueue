@@ -118,11 +118,11 @@ public without sharing class GitHubConflictBuildService {
                         'Final resolved PR built from Salesforce conflict session.'
                 );
 
-        sessionRow.Final_PR_Number__c = pr.number;
+        sessionRow.Final_PR_Number__c = pr.num;
         sessionRow.Status__c = 'Final PR Created';
         update sessionRow;
 
-        return pr.number;
+        return pr.num;
     }
 
     public static void mergeFinalPr(Id sessionId) {

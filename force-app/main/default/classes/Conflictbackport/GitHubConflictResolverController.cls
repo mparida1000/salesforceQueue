@@ -1,51 +1,29 @@
 public without sharing class GitHubConflictResolverController {
 
-    public Integer pr2Number {
-        get;
-        set;
-    }
-    public List < GitHub_Backport_Conflict__c > pendingConflicts {
-        get;
-        set;
-    }
+    public Id sessionId { get; set; }
+    public Id conflictId { get; set; }
 
-    public Id conflictId {
-        get;
-        set;
-    }
-    public GitHub_Backport_Conflict__c currentConflict {
-        get;
-        set;
-    }
+    public GitHub_Backport_Session__c sessionRow { get; set; }
+    public List<GitHub_Backport_Conflict__c> pendingConflicts { get; set; }
+    public List<GitHub_Backport_Conflict__c> resolvedConflicts { get; set; }
+    public List<GitHub_Backport_Conflict__c> safeFiles { get; set; }
 
-    public String sourceContent {
-        get;
-        set;
-    }
-    public String targetContent {
-        get;
-        set;
-    }
-    public String resolvedContent {
-        get;
-        set;
-    }
+    public GitHub_Backport_Conflict__c currentConflict { get; set; }
 
-    public String pageMessage {
-        get;
-        set;
-    }
-    public String languageName {
-        get;
-        set;
-    }
+    public String baseContent { get; set; }
+    public String sourceContent { get; set; }
+    public String targetContent { get; set; }
+    public String resolvedContent { get; set; }
+
+    public String pageMessage { get; set; }
+    public String languageName { get; set; }
 
     public GitHubConflictResolverController() {
-        String pr2Param = ApexPages.currentPage().getParameters().get('pr2');
+        String sessionParam = ApexPages.currentPage().getParameters().get('sessionId');
         String idParam = ApexPages.currentPage().getParameters().get('id');
 
-        if (!String.isBlank(pr2Param)) {
-            pr2Number = Integer.valueOf(pr2Param);
+        if (!String.isBlank(sessionParam)) {
+            sessionId = (Id) sessionParam;
             loadHome();
         }
 
@@ -56,125 +34,198 @@ public without sharing class GitHubConflictResolverController {
     }
 
     public void loadHome() {
+        sessionRow = [
+                SELECT Id, Source_PR_Number__c, Repo_Full_Name__c, Source_Branch__c, Source_Sha__c,
+                        Source_Base_Branch__c, Target_Branch__c, Merge_Base_Sha__c, Resolved_Branch__c,
+                        Final_PR_Number__c, Safe_File_Count__c, Conflict_File_Count__c,
+                        Resolved_File_Count__c, Status__c
+                FROM GitHub_Backport_Session__c
+                WHERE Id = :sessionId
+                LIMIT 1
+        ];
+
         pendingConflicts = [
-            SELECT Id, Name, Source_PR_Number__c, Target_PR_Number__c,
-            Repo_Full_Name__c, Source_Branch__c, Target_Branch__c,
-            Backport_Branch__c, File_Path__c, Status__c
-            FROM GitHub_Backport_Conflict__c
-            WHERE Target_PR_Number__c =: pr2Number
-            AND Status__c = 'Pending'
-            ORDER BY File_Path__c
+                SELECT Id, File_Path__c, Status__c, Sequence__c, Is_Safe_File__c
+                FROM GitHub_Backport_Conflict__c
+                WHERE Backport_Session__c = :sessionId
+                AND Is_Safe_File__c = false
+                AND Status__c = 'Pending'
+                ORDER BY Sequence__c
+        ];
+
+        resolvedConflicts = [
+                SELECT Id, File_Path__c, Status__c, Sequence__c, Is_Safe_File__c
+                FROM GitHub_Backport_Conflict__c
+                WHERE Backport_Session__c = :sessionId
+                AND Is_Safe_File__c = false
+                AND Status__c = 'Resolved'
+                ORDER BY Sequence__c
+        ];
+
+        safeFiles = [
+                SELECT Id, File_Path__c, Status__c, Sequence__c, Is_Safe_File__c
+                FROM GitHub_Backport_Conflict__c
+                WHERE Backport_Session__c = :sessionId
+                AND Is_Safe_File__c = true
+                ORDER BY Sequence__c
         ];
     }
 
     public void loadEditor() {
         currentConflict = [
-            SELECT Id, Name, Source_PR_Number__c, Target_PR_Number__c,
-            Repo_Full_Name__c, Source_Branch__c, Target_Branch__c,
-            Backport_Branch__c, File_Path__c, Status__c
-            FROM GitHub_Backport_Conflict__c
-            WHERE Id =: conflictId
-            LIMIT 1
+                SELECT Id, Backport_Session__c, File_Path__c, Base_Content__c, Source_Content__c,
+                        Target_Content__c, Resolved_Content__c, Status__c
+                FROM GitHub_Backport_Conflict__c
+                WHERE Id = :conflictId
+                LIMIT 1
         ];
 
-        List < String > parts = currentConflict.Repo_Full_Name__c.split('/');
-        String owner = parts[0];
-        String repo = parts[1];
+        sessionId = currentConflict.Backport_Session__c;
 
-        GitHubConflictGitService.FileContentResult src =
-            GitHubConflictGitService.getFileContent(
-                owner,
-                repo,
-                currentConflict.File_Path__c,
-                currentConflict.Source_Branch__c
-            );
-        
-        GitHubConflictGitService.FileContentResult tgt =
-            GitHubConflictGitService.getFileContent(
-                owner,
-                repo,
-                currentConflict.File_Path__c,
-                currentConflict.Target_Branch__c
-            );
-        
-        sourceContent = (src != null && src.exists) ? src.text : '';
-        targetContent = (tgt != null && tgt.exists) ? tgt.text : '';
+        baseContent = GitHubConflictUtils.safeString(currentConflict.Base_Content__c);
+        sourceContent = GitHubConflictUtils.safeString(currentConflict.Source_Content__c);
+        targetContent = GitHubConflictUtils.safeString(currentConflict.Target_Content__c);
 
-        resolvedContent = String.isBlank(sourceContent) ? targetContent : sourceContent;
+        if (!String.isBlank(currentConflict.Resolved_Content__c)) {
+            resolvedContent = currentConflict.Resolved_Content__c;
+        } else {
+            resolvedContent = String.isBlank(sourceContent) ? targetContent : sourceContent;
+        }
+
         languageName = GitHubConflictUtils.detectMonacoLanguage(currentConflict.File_Path__c);
     }
 
     public PageReference saveResolution() {
-        System.debug('GCRC saveResolution called');
-        System.debug('GCRC resolvedContent length=' + (resolvedContent == null ? null : resolvedContent.length()));
         try {
-            commitCurrentResolution();
+            currentConflict.Resolved_Content__c = resolvedContent;
+            currentConflict.Status__c = 'Resolved';
+            currentConflict.Resolved_By__c = UserInfo.getUserName();
+            currentConflict.Resolved_On__c = System.now();
+            currentConflict.Resolution_Note__c = 'Resolved via Salesforce Monaco editor';
+            update currentConflict;
+
+            refreshSessionResolvedCount();
+
             pageMessage = 'Resolution saved successfully.';
             loadEditor();
         } catch (Exception e) {
             pageMessage = 'Save failed: ' + e.getMessage();
-            System.debug('GCRC saveResolution error=' + e.getMessage());
         }
         return null;
     }
 
     public PageReference saveAndNext() {
-        System.debug('GCRC saveAndNext called');
-		System.debug('GCRC resolvedContent length=' + (resolvedContent == null ? null : resolvedContent.length()));
-        try {
-            commitCurrentResolution();
+        saveResolution();
 
-            List < GitHub_Backport_Conflict__c > nextRows = [
+        List<GitHub_Backport_Conflict__c> nextRows = [
                 SELECT Id
                 FROM GitHub_Backport_Conflict__c
-                WHERE Target_PR_Number__c =: currentConflict.Target_PR_Number__c
+                WHERE Backport_Session__c = :sessionId
+                AND Is_Safe_File__c = false
                 AND Status__c = 'Pending'
-                ORDER BY File_Path__c
+                ORDER BY Sequence__c
                 LIMIT 1
-            ];
+        ];
 
-            if (!nextRows.isEmpty()) {
-                PageReference nextPage = Page.GitHubConflictEditor;
-                nextPage.getParameters().put('id', String.valueOf(nextRows[0].Id));
-                nextPage.setRedirect(true);
-                return nextPage;
-            }
-
-            PageReference home = Page.GitHubConflictHome;
-            home.getParameters().put('pr2', String.valueOf(currentConflict.Target_PR_Number__c));
-            home.setRedirect(true);
-            return home;
-
-        } catch (Exception e) {
-            pageMessage = 'Save failed: ' + e.getMessage();
-            return null;
+        if (!nextRows.isEmpty()) {
+            PageReference nextPage = Page.GitHubConflictEditor;
+            nextPage.getParameters().put('id', String.valueOf(nextRows[0].Id));
+            nextPage.setRedirect(true);
+            return nextPage;
         }
+
+        PageReference home = Page.GitHubConflictHome;
+        home.getParameters().put('sessionId', String.valueOf(sessionId));
+        home.setRedirect(true);
+        return home;
     }
 
-    private void commitCurrentResolution() {
-        System.debug('GCRC commitCurrentResolution called');
-		System.debug('GCRC conflictId=' + currentConflict.Id);
-		System.debug('GCRC file=' + currentConflict.File_Path__c);	
-        List < String > parts = currentConflict.Repo_Full_Name__c.split('/');
-        String owner = parts[0];
-        String repo = parts[1];
+    public PageReference buildFinalBranchAction() {
+        try {
+            GitHubConflictBuildService.buildFinalBranch(sessionId);
+            pageMessage = 'Final branch built successfully.';
+            loadHome();
+        } catch (Exception e) {
+            pageMessage = 'Build failed: ' + e.getMessage();
+        }
+        return null;
+    }
 
-        String commitMessage = 'Resolve conflict for ' + currentConflict.File_Path__c;
+    public PageReference createFinalPrAction() {
+        try {
+            Integer prNum = GitHubConflictBuildService.createFinalPr(sessionId);
+            pageMessage = 'Final PR created successfully. PR #' + prNum;
+            loadHome();
+        } catch (Exception e) {
+            pageMessage = 'Create PR failed: ' + e.getMessage();
+        }
+        return null;
+    }
 
-        GitHubConflictGitService.putResolvedFile(
-            owner,
-            repo,
-            currentConflict.Backport_Branch__c,
-            currentConflict.File_Path__c,
-            resolvedContent,
-            commitMessage
+    public PageReference mergeFinalPrAction() {
+        try {
+            GitHubConflictBuildService.mergeFinalPr(sessionId);
+            pageMessage = 'Final PR merged successfully.';
+            loadHome();
+        } catch (Exception e) {
+            pageMessage = 'Merge failed: ' + e.getMessage();
+        }
+        return null;
+    }
+
+    public Boolean getCanBuildFinalBranch() {
+        return sessionRow != null &&
+                pendingConflicts != null &&
+                pendingConflicts.isEmpty() &&
+                (sessionRow.Status__c == 'In Progress' || sessionRow.Status__c == 'Ready To Build');
+    }
+
+    public Boolean getCanCreateFinalPr() {
+        return sessionRow != null &&
+                sessionRow.Status__c == 'Built' &&
+                sessionRow.Final_PR_Number__c == null;
+    }
+
+    public Boolean getCanMergeFinalPr() {
+        return sessionRow != null &&
+                sessionRow.Status__c == 'Final PR Created' &&
+                sessionRow.Final_PR_Number__c != null;
+    }
+
+    public String getFinalPrUrl() {
+        if (sessionRow == null || sessionRow.Final_PR_Number__c == null || String.isBlank(sessionRow.Repo_Full_Name__c)) return null;
+        return 'https://github.com/' + sessionRow.Repo_Full_Name__c + '/pull/' +
+                Integer.valueOf(String.valueOf(sessionRow.Final_PR_Number__c));
+    }
+
+    private void refreshSessionResolvedCount() {
+        Integer resolvedCount = [
+                SELECT COUNT()
+                FROM GitHub_Backport_Conflict__c
+                WHERE Backport_Session__c = :sessionId
+                AND Is_Safe_File__c = false
+                AND Status__c = 'Resolved'
+        ];
+
+        if (sessionRow == null) {
+            sessionRow = [
+                    SELECT Id, Conflict_File_Count__c
+                    FROM GitHub_Backport_Session__c
+                    WHERE Id = :sessionId
+                    LIMIT 1
+            ];
+        }
+
+        GitHub_Backport_Session__c s = new GitHub_Backport_Session__c(
+                Id = sessionId,
+                Resolved_File_Count__c = resolvedCount,
+                Status__c = resolvedCount >= sessionRow.Conflict_File_Count__c ? 'Ready To Build' : 'In Progress'
         );
+        update s;
+    }
 
-        currentConflict.Status__c = 'Committed';
-        currentConflict.Resolution_Note__c = 'Resolved via VF Monaco editor';
-        currentConflict.Resolved_By__c = UserInfo.getUserName();
-        currentConflict.Resolved_On__c = System.now();
-        update currentConflict;
+    public String getBaseJson() {
+        return JSON.serialize(baseContent == null ? '' : baseContent);
     }
 
     public String getSourceJson() {
